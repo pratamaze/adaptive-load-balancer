@@ -1,0 +1,61 @@
+version: "3.8"
+    
+services:
+  # 1. Entry Point / Load Balancer
+  # Constraint: node.role == manager (Berjalan di ripe-ubuntu)
+  entry-point:
+    image: pratamaze/entry-point:latest # Menggunakan pratamaze/
+    ports:
+      - "80:8080" # Map port 80 Host ke port 8080 Container
+    networks:
+      - lb-net
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager # Target: ripe-ubuntu (Leader)
+
+  # 2. Backend API Node 1 
+  # Constraint: node.hostname == node1.api
+  # 2. Backend API Node 1 
+  api-node1:
+    image: pratamaze/api-service:latest 
+    networks:
+      - lb-net
+    command: ["/apiservice", "-name", "API-NODE-1"] 
+    # --- TAMBAHKAN BARIS INI ---
+    volumes:
+      - /proc:/host/proc:ro # Map /proc host ke /host/proc container (read-only)
+    # --------------------------
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.hostname == node1.api 
+
+  # 3. Backend API Node 2
+  api-node2:
+    image: pratamaze/api-service:latest 
+    networks:
+      - lb-net
+    command: ["/apiservice", "-name", "API-NODE-2"]
+    # --- TAMBAHKAN BARIS INI ---
+    volumes:
+      - /proc:/host/proc:ro # Map /proc host ke /host/proc container (read-only)
+    # --------------------------
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.hostname == node2.api 
+
+          
+  # Catatan: api-node3 telah dihapus karena Anda hanya memiliki dua worker node (node1.api, node2.api)
+    
+networks:
+  lb-net:
+    driver: overlay # Jaringan overlay untuk komunikasi antar-node
+    attachable: true
