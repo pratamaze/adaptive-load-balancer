@@ -25,39 +25,42 @@ type NodeMetrics struct {
 type Node struct {
 	Name string
 	URL  *url.URL
-	// Field metrik untuk F-PSO
+	// Field metrik untuk F-PSO, dilindungi oleh Mutex
 	CPUUsage     float64
 	LoadAverage  float64
 	MemoryUsage  float64
 	ResponseTime float64
 
-	mutex sync.RWMutex // Melindungi field metrik
+	mutex sync.RWMutex // Melindungi field metrik di atas
 }
 
 // NodePool menampung node-node backend
 type NodePool struct {
 	nodes  []*Node
-	client *http.Client // HTTP client untuk memanggil /metrics
+	client *http.Client // HTTP client khusus untuk memanggil /metrics
 }
 
-// getRealNodeMetrics mengambil data dari endpoint /metrics
+// getRealNodeMetrics mengambil data dari endpoint /metrics dan mengupdate SATU node
+// Fungsi ini dipanggil oleh background collector
 func (p *NodePool) getRealNodeMetrics(node *Node) {
-	// Bangun URL metrics, cth: http://api-node1:8080/metrics
 	metricsURL := node.URL.String() + "/metrics"
 	startTime := time.Now()
 
 	req, _ := http.NewRequest("GET", metricsURL, nil)
 	resp, err := p.client.Do(req)
 
-	// Hitung Waktu Respon
 	responseTime := time.Since(startTime).Seconds() * 1000 // dalam ms
 
+	// --- Gunakan Lock (Write Lock) ---
 	node.mutex.Lock()
 	defer node.mutex.Unlock()
 
 	// Jika GAGAL (node mati, timeout, dll.)
 	if err != nil {
 		log.Printf("[METRIC] Gagal mengambil metrik dari %s: %v\n", node.Name, err)
+		// Beri penalti agar tidak dipilih oleh F-PSO
+		node.CPUUsage = 100.0       // Set CPU ke max
+		node.ResponseTime = 99999.0 // Set latensi ke max
 		return
 	}
 	defer resp.Body.Close()
@@ -85,11 +88,10 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 		node.Name, node.CPUUsage, node.LoadAverage, node.ResponseTime)
 }
 
-// selectBackend_F_PSO_Framework kini menggunakan data real-time
-func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
-	log.Println("[F-PSO] Memulai fase pengumpulan metrik real-time...")
+// --- FUNGSI BARU UNTUK BACKGROUND COLLECTOR ---
 
-	// 1. Fase Pengumpulan Metrik (Real-Time)
+// updateAllMetrics memicu update paralel ke SEMUA node
+func (p *NodePool) updateAllMetrics() {
 	var wg sync.WaitGroup
 	for _, node := range p.nodes {
 		wg.Add(1)
@@ -99,40 +101,81 @@ func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
 		}(node)
 	}
 	wg.Wait()
-	log.Println("[F-PSO] Pengumpulan metrik selesai.")
+}
 
-	// 2. Fase Pemilihan (Placeholder: Pilih CPU Terendah)
-	// --- DI SINILAH LOGIKA F-PSO ANDA AKAN DITEMPATKAN ---
+// startMetricsCollector memulai goroutine di background untuk mengambil metrik
+func (p *NodePool) startMetricsCollector(interval time.Duration) {
+	log.Printf("[METRIC-COLLECTOR] Memulai kolektor metrik (setiap %s)\n", interval)
+
+	// Jalankan satu kali di awal agar data tidak kosong saat server baru menyala
+	p.updateAllMetrics()
+
+	// Jalankan ticker di goroutine terpisah
+	go func() {
+		ticker := time.NewTicker(interval)
+		for range ticker.C {
+			log.Println("[METRIC-COLLECTOR] Memulai pengambilan metrik periodik...")
+			p.updateAllMetrics()
+		}
+	}()
+}
+
+// --- FUNGSI SELEKSI DIPERBARUI ---
+
+// selectBackend_F_PSO_Framework kini HANYA MEMBACA metrik, super cepat!
+func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
+	// Fungsi ini tidak lagi mengambil metrik, hanya membaca dari memori.
+	// Ini membuatnya sangat cepat dan tidak menambah latensi pada request user.
 
 	var bestNode *Node
-	minCPU := math.MaxFloat64
+	minCPU := math.MaxFloat64 // Nanti ganti dengan logika F-PSO Anda
 
+	// --- DI SINILAH LOGIKA F-PSO ANDA AKAN DITEMPATKAN ---
+	// Iterasi semua node dan baca metriknya
 	for _, node := range p.nodes {
+		// --- Gunakan RLock (Read Lock) ---
 		node.mutex.RLock()
-		if node.CPUUsage < minCPU {
-			minCPU = node.CPUUsage
+		// Ambil metrik yang sudah di-update oleh background collector
+		currentCPU := node.CPUUsage
+		// currentLoad := node.LoadAverage
+		// currentLatency := node.ResponseTime
+		node.mutex.RUnlock()
+		// --- Selesai RLock ---
+
+		// (Contoh logika: Pilih CPU terendah)
+		if currentCPU < minCPU {
+			minCPU = currentCPU
 			bestNode = node
 		}
-		node.mutex.RUnlock()
 	}
 	// --- AKHIR DARI LOGIKA F-PSO ---
 
 	if bestNode == nil {
-		log.Println("[F-PSO] Tidak ada node yang tersedia, kembali ke node pertama.")
-		bestNode = p.nodes[0] // Fallback
+		log.Println("[F-PSO] Peringatan: Tidak ada node yang valid, kembali ke node pertama.")
+		if len(p.nodes) > 0 {
+			bestNode = p.nodes[0] // Fallback
+		} else {
+			log.Println("[F-PSO] Error: Tidak ada node di pool!")
+			return nil // Seharusnya tidak terjadi
+		}
 	}
 
-	// 3. Output Log
-	log.Printf("[F-PSO] Metrik telah dihitung, dan F-PSO memilih Node: %s (CPU Terendah: %.2f%%)\n", bestNode.Name, minCPU)
-
+	log.Printf("[F-PSO] Logika F-PSO memilih Node: %s (Metrik: CPU %.2f%%)\n", bestNode.Name, minCPU)
 	return bestNode
 }
 
+// newReverseProxy membuat instance reverse proxy
 func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			// Memilih backend menggunakan kerangka F-PSO
+			// Ini sekarang SANGAT CEPAT
 			backendNode := pool.selectBackend_F_PSO_Framework()
+
+			if backendNode == nil {
+				log.Println("Gagal memilih backend, tidak ada node tersedia.")
+				return
+			}
 
 			// Mengarahkan request ke node yang dipilih
 			req.URL.Scheme = backendNode.URL.Scheme
@@ -155,17 +198,16 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 }
 
 func main() {
-	// --- PERUBAHAN DI SINI ---
-	// Inisialisasi daftar Node HANYA 2 NODE
+	// Inisialisasi daftar Node
 	backendDNS := []string{
 		"http://api-node1:8080",
 		"http://api-node2:8080",
+		// Tambahkan node lain di sini jika perlu
 	}
-	// -------------------------
 
 	// Buat HTTP client khusus untuk metrik
 	metricsClient := &http.Client{
-		Timeout: 1 * time.Second, // Timeout 3 detik
+		Timeout: 1500 * time.Millisecond, // Timeout 1.5 detik (lebih cepat dari interval)
 	}
 
 	pool := &NodePool{client: metricsClient}
@@ -174,9 +216,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Gagal mem-parse URL backend: %v", err)
 		}
-		// --- PERUBAHAN DI SINI ---
-		nodeName := fmt.Sprintf("api-node%d", i+1) // Tetap api-node1, api-node2
-		// -------------------------
+		nodeName := fmt.Sprintf("api-node%d", i+1)
 
 		pool.nodes = append(pool.nodes, &Node{
 			Name: nodeName,
@@ -185,10 +225,16 @@ func main() {
 		log.Printf("Mendaftarkan backend node: %s di %s\n", nodeName, backendURL)
 	}
 
+	// --- PERUBAHAN KRUSIAL ---
+	// Jalankan kolektor metrik di background.
+	// Metrik akan di-update setiap 2 detik.
+	pool.startMetricsCollector(2 * time.Second)
+	// -------------------------
+
 	// Membuat reverse proxy
 	proxy := newReverseProxy(pool)
 
-	log.Println("Memulai Load Balancer F-PSO (Mode Real-Time) di port :8080...")
+	log.Println("Memulai Load Balancer F-PSO (Mode Asinkron) di port :8080...")
 	// Jalankan server proxy
 	if err := http.ListenAndServe(":8080", proxy); err != nil {
 		log.Fatalf("Gagal memulai server proxy: %v", err)
