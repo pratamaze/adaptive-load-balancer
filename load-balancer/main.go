@@ -205,7 +205,6 @@ func main() {
 		// Tambahkan node lain di sini jika perlu
 	}
 
-	// Buat HTTP client khusus untuk metrik
 	metricsClient := &http.Client{
 		Timeout: 1500 * time.Millisecond, // Timeout 1.5 detik (lebih cepat dari interval)
 	}
