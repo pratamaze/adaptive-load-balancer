@@ -65,7 +65,7 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 	}
 	defer resp.Body.Close()
 
-	// Jika SUKSES
+	// Jika SUKSESshut
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("[METRIC] Gagal membaca body dari %s: %v\n", node.Name, err)
