@@ -114,6 +114,7 @@ func (p *NodePool) startMetricsCollector(interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		for range ticker.C {
+			log.Println()
 			log.Println("[METRIC-COLLECTOR] Memulai pengambilan metrik periodik...")
 			p.updateAllMetrics()
 		}
@@ -185,7 +186,9 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 		},
 
 		ModifyResponse: func(res *http.Response) error {
+			log.Println()
 			log.Printf("[MONITOR] Menerima response %d dari %s\n", res.StatusCode, res.Request.URL.Host)
+			log.Println()
 			return nil
 		},
 
