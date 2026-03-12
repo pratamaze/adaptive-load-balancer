@@ -167,10 +167,18 @@ func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
 
 // newReverseProxy membuat instance reverse proxy
 func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
+
+	customTransport := &http.Transport{
+		MaxIdleConns:          1000,             // Total maksimal koneksi idle keseluruhan
+		MaxIdleConnsPerHost:   500,              // Maksimal koneksi ke tiap backend (api-node1 & api-node2)
+		IdleConnTimeout:       90 * time.Second, // Waktu tunggu sebelum koneksi yang tidak dipakai diputus
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	proxy := &httputil.ReverseProxy{
+		Transport: customTransport, // 2. Pasang transport ini ke proxy Anda
 		Director: func(req *http.Request) {
-			// Memilih backend menggunakan kerangka F-PSO
-			// Ini sekarang SANGAT CEPAT
 			backendNode := pool.selectBackend_F_PSO_Framework()
 
 			if backendNode == nil {
