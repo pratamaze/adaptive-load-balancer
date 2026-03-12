@@ -8,13 +8,11 @@ import (
 	"net/http"
 	"os"
 
-	// Tetap dibutuhkan untuk cpu.Percent
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-// ResponseData adalah struktur untuk balasan JSON
 type ResponseData struct {
 	Message   string `json:"message"`
 	NodeName  string `json:"node_name"`
@@ -22,7 +20,6 @@ type ResponseData struct {
 	RequestIP string `json:"request_ip"`
 }
 
-// NodeMetrics adalah struktur untuk melaporkan metrik
 type NodeMetrics struct {
 	NodeName     string  `json:"node_name"`
 	CPUUsage     float64 `json:"cpu_usage"`      // Persentase CPU
