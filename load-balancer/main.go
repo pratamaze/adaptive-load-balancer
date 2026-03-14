@@ -169,9 +169,10 @@ func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
 func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 
 	customTransport := &http.Transport{
-		MaxIdleConns:          1000,             // Total maksimal koneksi idle keseluruhan
-		MaxIdleConnsPerHost:   500,              // Maksimal koneksi ke tiap backend (api-node1 & api-node2)
-		IdleConnTimeout:       90 * time.Second, // Waktu tunggu sebelum koneksi yang tidak dipakai diputus
+		MaxIdleConns:          10000, // Total koneksi keseluruhan
+		MaxIdleConnsPerHost:   5000,  // Batas koneksi nganggur per backend
+		MaxConnsPerHost:       5000,  // Batas koneksi aktif per backend
+		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
@@ -218,7 +219,7 @@ func main() {
 
 	// Buat HTTP client khusus untuk metrik
 	metricsClient := &http.Client{
-		Timeout: 1500 * time.Millisecond, // Timeout 1.5 detik (lebih cepat dari interval)
+		Timeout: 500 * time.Millisecond, // Timeout 0.5 detik (lebih cepat dari interval)
 	}
 
 	pool := &NodePool{client: metricsClient}
@@ -239,7 +240,7 @@ func main() {
 	// --- PERUBAHAN KRUSIAL ---
 	// Jalankan kolektor metrik di background.
 	// Metrik akan di-update setiap 2 detik.
-	pool.startMetricsCollector(2 * time.Second)
+	pool.startMetricsCollector(500 * time.Millisecond)
 	// -------------------------
 
 	// Membuat reverse proxy
