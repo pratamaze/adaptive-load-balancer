@@ -219,7 +219,7 @@ func main() {
 
 	// Buat HTTP client khusus untuk metrik
 	metricsClient := &http.Client{
-		Timeout: 1500 * time.Millisecond, // Timeout 1.5 detik (lebih cepat dari interval)
+		Timeout: 500 * time.Millisecond, // Timeout 0.5 detik (lebih cepat dari interval)
 	}
 
 	pool := &NodePool{client: metricsClient}
@@ -240,7 +240,7 @@ func main() {
 	// --- PERUBAHAN KRUSIAL ---
 	// Jalankan kolektor metrik di background.
 	// Metrik akan di-update setiap 2 detik.
-	pool.startMetricsCollector(2 * time.Second)
+	pool.startMetricsCollector(500 * time.Millisecond)
 	// -------------------------
 
 	// Membuat reverse proxy
