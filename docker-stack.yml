@@ -57,5 +57,7 @@ services:
     
 networks:
   lb-net:
-    driver: overlay # Jaringan overlay untuk komunikasi antar-node
+    driver: overlay
     attachable: true
+    driver_opts:
+      com.docker.network.driver.mtu: "1200" # <-- PENTING: Mengecilkan paket agar muat di Tailscale
