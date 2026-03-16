@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"load-balancer/pkg/fuzzy"
 	"log"
-	"math"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -38,6 +38,13 @@ type Node struct {
 type NodePool struct {
 	nodes  []*Node
 	client *http.Client // HTTP client khusus untuk memanggil /metrics
+}
+
+// 27 rules
+var myRules = []fuzzy.Rule{
+	{CPULabel: "Rendah", QueueLabel: "Rendah", RespLabel: "Cepat", OutputLabel: "Tinggi"},
+	{CPULabel: "Sedang", QueueLabel: "Sedang", RespLabel: "Normal", OutputLabel: "Sedang"},
+	{CPULabel: "Tinggi", QueueLabel: "Tinggi", RespLabel: "Lambat", OutputLabel: "Rendah"},
 }
 
 // getRealNodeMetrics mengambil data dari endpoint /metrics dan mengupdate SATU node
@@ -125,43 +132,46 @@ func (p *NodePool) startMetricsCollector(interval time.Duration) {
 
 // selectBackend_F_PSO_Framework kini HANYA MEMBACA metrik, super cepat!
 func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
-	// Fungsi ini tidak lagi mengambil metrik, hanya membaca dari memori.
-	// Ini membuatnya sangat cepat dan tidak menambah latensi pada request user.
-
 	var bestNode *Node
-	minCPU := math.MaxFloat64 // Nanti ganti dengan logika F-PSO Anda
 
-	// --- DI SINILAH LOGIKA F-PSO ANDA AKAN DITEMPATKAN ---
-	// Iterasi semua node dan baca metriknya
+	// 1. Ubah nilai awal menjadi sangat besar (bukan -1.0 lagi)
+	minScore := 9999.0
+
 	for _, node := range p.nodes {
-		// --- Gunakan RLock (Read Lock) ---
 		node.mutex.RLock()
-		// Ambil metrik yang sudah di-update oleh background collector
-		currentCPU := node.CPUUsage
-		// currentLoad := node.LoadAverage
-		// currentLatency := node.ResponseTime
+		metrics := fuzzy.NodeMetrics{
+			CPU:         node.CPUUsage,
+			QueueLength: node.LoadAverage * 10,
+			RespTime:    node.ResponseTime,
+		}
 		node.mutex.RUnlock()
-		// --- Selesai RLock ---
 
-		// (Contoh logika: Pilih CPU terendah)
-		if currentCPU < minCPU {
-			minCPU = currentCPU
+		score := fuzzy.CalculateMamdani(metrics, myRules)
+
+		// Hapus bagian log.Printf dari sini agar terminalmu tidak lag
+		// (pindahkan ke bawah nanti)
+
+		// 2. UBAH LOGIKA: Cari skor PALING KECIL (Paling nganggur)
+		if score < minScore {
+			minScore = score
 			bestNode = node
-		}
-	}
-	// --- AKHIR DARI LOGIKA F-PSO ---
+		} else if score == minScore && bestNode != nil {
+			// Tie-breaker: Cari CPU terkecil
+			node.mutex.RLock()
+			bestNodeCPU := bestNode.CPUUsage
+			node.mutex.RUnlock()
 
-	if bestNode == nil {
-		log.Println("[F-PSO] Peringatan: Tidak ada node yang valid, kembali ke node pertama.")
-		if len(p.nodes) > 0 {
-			bestNode = p.nodes[0] // Fallback
-		} else {
-			log.Println("[F-PSO] Error: Tidak ada node di pool!")
-			return nil // Seharusnya tidak terjadi
+			if metrics.CPU < bestNodeCPU {
+				bestNode = node
+			}
 		}
 	}
 
-	log.Printf("[F-PSO] Logika F-PSO memilih Node: %s (Metrik: CPU %.2f%%)\n", bestNode.Name, minCPU)
+	// (Opsional) Cetak keputusan akhirnya saja biar log lebih rapi
+	if bestNode != nil {
+		log.Printf("[DECISION] Memilih %s | Beban (Score) Terendah: %.4f", bestNode.Name, minScore)
+	}
+
 	return bestNode
 }
 
@@ -239,7 +249,7 @@ func main() {
 
 	// --- PERUBAHAN KRUSIAL ---
 	// Jalankan kolektor metrik di background.
-	// Metrik akan di-update setiap 2 detik.
+	// Metrik akan di-update setiap
 	pool.startMetricsCollector(500 * time.Millisecond)
 	// -------------------------
 
