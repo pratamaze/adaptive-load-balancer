@@ -4,7 +4,7 @@ services:
   # 1. Entry Point / Load Balancer
   # Constraint: node.role == manager (Berjalan di ripe-ubuntu)
   entry-point:
-    image: pratamaze/entry-point:latest # Menggunakan pratamaze/
+    image: pratamaze/entry-point:f-grafana # Menggunakan pratamaze/
     ports:
       - "80:8080" # Map port 80 Host ke port 8080 Container
     networks:
@@ -55,6 +55,19 @@ services:
           
   # Catatan: api-node3 telah dihapus karena Anda hanya memiliki dua worker node (node1.api, node2.api)
     
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - lb-net
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - lb-net
+
 networks:
   lb-net:
     driver: overlay
