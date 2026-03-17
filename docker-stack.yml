@@ -1,76 +1,83 @@
 version: "3.8"
     
 services:
-  # 1. Entry Point / Load Balancer
-  # Constraint: node.role == manager (Berjalan di ripe-ubuntu)
+  # 1. Entry Point / Load Balancer (Jalan di Manager / Node 3)
   entry-point:
-    image: pratamaze/entry-point:f-grafana # Menggunakan pratamaze/
+    image: pratamaze/entry-point:f-grafana 
     ports:
-      - "80:8080" # Map port 80 Host ke port 8080 Container
+      - "80:8080" # Akses publik masuk lewat port 80 VPS Node 3
     networks:
       - lb-net
+    volumes : 
+      - /root/load-balancer/logs:/logs
     deploy:
       mode: replicated
       replicas: 1
       placement:
         constraints:
-          - node.role == manager # Target: ripe-ubuntu (Leader)
+          - node.role == manager # Otomatis diletakkan di Leader/Manager (Node 3)
 
-  # 2. Backend API Node 1 
-  # Constraint: node.hostname == node1.api
-  # 2. Backend API Node 1 
+  # 2. Backend API Node 1 (Kinerja Penuh 100%)
   api-node1:
     image: pratamaze/api-service:latest 
     networks:
       - lb-net
     command: ["/apiservice", "-name", "API-NODE-1"] 
-    # --- TAMBAHKAN BARIS INI ---
     volumes:
-      - /proc:/host/proc:ro # Map /proc host ke /host/proc container (read-only)
-    # --------------------------
+      - /proc:/host/proc:ro # Membaca metrik CPU/Load asli dari Host VPS
     deploy:
       mode: replicated
       replicas: 1
       placement:
         constraints:
+          # Pastikan ini sesuai dengan nama hostname VPS Node 1 kamu saat di-cek dengan 'hostname'
           - node.hostname == node1.api 
 
-  # 3. Backend API Node 2
+  # 3. Backend API Node 2 (Simulasi Heterogen: Kinerja 50%)
   api-node2:
     image: pratamaze/api-service:latest 
     networks:
       - lb-net
     command: ["/apiservice", "-name", "API-NODE-2"]
-    # --- TAMBAHKAN BARIS INI ---
     volumes:
-      - /proc:/host/proc:ro # Map /proc host ke /host/proc container (read-only)
-    # --------------------------
+      - /proc:/host/proc:ro
     deploy:
       mode: replicated
       replicas: 1
       placement:
         constraints:
           - node.hostname == node2.api 
+      # --- TAMBAHAN UNTUK RISET HETEROGEN ---
+      resources:
+        limits:
+          cpus: '0.5' # Membatasi container ini hanya boleh pakai 50% core CPU VPS
+      # --------------------------------------
 
-          
-  # Catatan: api-node3 telah dihapus karena Anda hanya memiliki dua worker node (node1.api, node2.api)
-    
   prometheus:
-    image: prom/prometheus
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     networks:
       - lb-net
+    deploy:
+      placement:
+        constraints: [node.role == manager]
+
   grafana:
-    image: grafana/grafana
+    image: grafana/grafana:latest
     ports:
       - "3000:3000"
     networks:
       - lb-net
-
+    deploy:
+      placement:
+        constraints: [node.role == manager]
 networks:
   lb-net:
     driver: overlay
     attachable: true
-    driver_opts:
-      com.docker.network.driver.mtu: "1200" # <-- PENTING: Mengecilkan paket agar muat di Tailscale
+    # --- PENTING ---
+    # Konfigurasi MTU 1200 untuk Tailscale DIHAPUS. 
+    # Sekarang Docker menggunakan MTU default agar kecepatan jaringan maksimal.
