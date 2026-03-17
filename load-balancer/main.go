@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -137,12 +138,12 @@ func (p *NodePool) startMetricsCollector(interval time.Duration) {
 
 // --- FUNGSI SELEKSI DIPERBARUI ---
 
-// selectBackend_F_PSO_Framework kini HANYA MEMBACA metrik, super cepat!
 func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
 	var bestNode *Node
+	maxScore := -1.0
 
-	// 1. Ubah nilai awal menjadi sangat besar (bukan -1.0 lagi)
-	minScore := 9999.0
+	// Variabel string untuk merangkum detail perhitungan semua node
+	var detailLog string
 
 	for _, node := range p.nodes {
 		node.mutex.RLock()
@@ -155,15 +156,14 @@ func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
 
 		score := fuzzy.CalculateMamdani(metrics, myRules)
 
-		// Hapus bagian log.Printf dari sini agar terminalmu tidak lag
-		// (pindahkan ke bawah nanti)
+		// Rangkum hitungan eksak ke dalam string
+		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=%.4f] ",
+			node.Name, metrics.CPU, metrics.QueueLength, metrics.RespTime, score)
 
-		// 2. UBAH LOGIKA: Cari skor PALING KECIL (Paling nganggur)
-		if score < minScore {
-			minScore = score
+		if score > maxScore {
+			maxScore = score
 			bestNode = node
-		} else if score == minScore && bestNode != nil {
-			// Tie-breaker: Cari CPU terkecil
+		} else if score == maxScore && bestNode != nil {
 			node.mutex.RLock()
 			bestNodeCPU := bestNode.CPUUsage
 			node.mutex.RUnlock()
@@ -174,9 +174,9 @@ func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
 		}
 	}
 
-	// (Opsional) Cetak keputusan akhirnya saja biar log lebih rapi
 	if bestNode != nil {
-		log.Printf("[DECISION] Memilih %s | Beban (Score) Terendah: %.4f", bestNode.Name, minScore)
+		// Cetak satu baris log komprehensif untuk bukti pengujian
+		log.Printf("[DECISION] %s ==> TERPILIH: %s\n", detailLog, bestNode.Name)
 	}
 
 	return bestNode
@@ -212,9 +212,9 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 		},
 
 		ModifyResponse: func(res *http.Response) error {
-			log.Println()
-			log.Printf("[MONITOR] Menerima response %d dari %s\n", res.StatusCode, res.Request.URL.Host)
-			log.Println()
+			// log.Println()
+			// log.Printf("[MONITOR] Menerima response %d dari %s\n", res.StatusCode, res.Request.URL.Host)
+			// log.Println()
 			return nil
 		},
 
@@ -252,6 +252,22 @@ func init() {
 }
 
 func main() {
+
+	// --- TAMBAHAN UNTUK MENYIMPAN LOG KE FILE ---
+	// Membuat folder /logs jika belum ada
+	os.MkdirAll("/logs", os.ModePerm)
+
+	// Membuka atau membuat file pso_evaluation.log
+	logFile, err := os.OpenFile("/logs/pso_evaluation.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("Gagal membuka file log: %v", err)
+	}
+	defer logFile.Close()
+
+	// Gunakan MultiWriter: Log akan muncul di terminal DAN ditulis ke file
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	log.SetOutput(multiWriter)
+
 	// Inisialisasi daftar Node
 	backendDNS := []string{
 		"http://api-node1:8080",
