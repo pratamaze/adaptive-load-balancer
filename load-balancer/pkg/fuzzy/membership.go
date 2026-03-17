@@ -1,16 +1,21 @@
 package fuzzy
 
 // Fuzzify menghitung derajat keanggotaan berdasarkan kurva segitiga
+// Fuzzify menghitung derajat keanggotaan berdasarkan kurva segitiga
 func Fuzzify(val float64, mf Triple) float64 {
-	if val <= mf.A || val >= mf.C {
-		return 0
-	}
+	// 1. CEK PUNCAK DULU: Harus mengembalikan nilai 1
 	if val == mf.B {
-		return 1
+		return 1.0
 	}
+	// 2. CEK BATAS LUAR: Jika nilai di luar kurva segitiga
+	if val <= mf.A || val >= mf.C {
+		return 0.0
+	}
+	// 3. KEMIRINGAN NAIK
 	if val < mf.B {
 		return (val - mf.A) / (mf.B - mf.A)
 	}
+	// 4. KEMIRINGAN TURUN
 	return (mf.C - val) / (mf.C - mf.B)
 }
 
