@@ -11,6 +11,9 @@ import (
 	"net/url"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Harus sama dengan yang ada di api-service
@@ -90,6 +93,10 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 	node.LoadAverage = metrics.LoadAverage1
 	node.MemoryUsage = metrics.MemoryUsage
 	node.ResponseTime = responseTime // Waktu respon real dari panggilan /metrics
+
+	// Kirim data terbaru ke Prometheus Exporter
+	cpuGauge.WithLabelValues(node.Name).Set(metrics.CPUUsage)
+	latencyGauge.WithLabelValues(node.Name).Set(responseTime)
 
 	log.Printf("[METRIC] Node %s: CPU=%.2f%%, Load=%.2f, Latency=%.2fms\n",
 		node.Name, node.CPUUsage, node.LoadAverage, node.ResponseTime)
@@ -219,6 +226,31 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 	return proxy
 }
 
+var (
+	// Wadah untuk metrik CPU per node
+	cpuGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pso_node_cpu_usage",
+			Help: "Penggunaan CPU node backend (%)",
+		},
+		[]string{"node_name"},
+	)
+	// Wadah untuk metrik Latensi per node
+	latencyGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pso_node_latency_ms",
+			Help: "Latensi komunikasi ke node (ms)",
+		},
+		[]string{"node_name"},
+	)
+)
+
+func init() {
+	// Mendaftarkan metrik ke sistem Prometheus
+	prometheus.MustRegister(cpuGauge)
+	prometheus.MustRegister(latencyGauge)
+}
+
 func main() {
 	// Inisialisasi daftar Node
 	backendDNS := []string{
@@ -253,12 +285,37 @@ func main() {
 	pool.startMetricsCollector(500 * time.Millisecond)
 	// -------------------------
 
-	// Membuat reverse proxy
+	// 1. Inisialisasi Mux
+	mux := http.NewServeMux()
+
+	// Gunakan full path agar tidak tertukar
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// 3. Buat handler untuk proxy
 	proxy := newReverseProxy(pool)
 
-	log.Println("Memulai Load Balancer F-PSO (Mode Asinkron) di port :8080...")
-	// Jalankan server proxy
-	if err := http.ListenAndServe(":8080", proxy); err != nil {
-		log.Fatalf("Gagal memulai server proxy: %v", err)
+	//  HandleFunc untuk "/" tapi beri pengecekan manual
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Jika request datang ke /metrics tapi tidak sengaja masuk ke sini
+		if r.URL.Path == "/metrics" {
+			promhttp.Handler().ServeHTTP(w, r)
+			return
+		}
+		// Jalankan proxy untuk trafik lainnya
+		proxy.ServeHTTP(w, r)
+	})
+
+	log.Println("Memulai Load Balancer di port :8080...")
+
+	//  konfigurasi server dengan timeout agar tidak hang selamanya
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("Gagal memulai server: %v", err)
 	}
 }
