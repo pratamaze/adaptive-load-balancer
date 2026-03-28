@@ -294,7 +294,7 @@ func main() {
 	}
 	defer logFile.Close()
 
-	// Gunakan MultiWriter: Log akan muncul di terminal DAN ditulis ke file
+	// Log muncul di terminal DAN ditulis ke file
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(multiWriter)
 
@@ -302,10 +302,9 @@ func main() {
 	backendDNS := []string{
 		"http://api-node1:8080",
 		"http://api-node2:8080",
-		// Tambahkan node lain di sini jika perlu
 	}
 
-	// Buat HTTP client khusus untuk metrik
+	//  HTTP client khusus untuk metrik
 	metricsClient := &http.Client{
 		Timeout: 500 * time.Millisecond, // Timeout 0.5 detik (lebih cepat dari interval)
 	}
