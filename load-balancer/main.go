@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"load-balancer/pkg/fuzzy"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -12,6 +11,9 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"load-balancer/pkg/fuzzy"
+	"load-balancer/pkg/roundrobin"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -166,7 +168,39 @@ func (p *NodePool) startMetricsCollector(interval time.Duration) {
 	}()
 }
 
-// --- FUNGSI SELEKSI DIPERBARUI ---
+var rrBalancer = roundrobin.New()
+
+func (p *NodePool) selectBackend_RoundRobin() *Node {
+	totalNodes := len(p.nodes)
+	if totalNodes == 0 {
+		return nil
+	}
+
+	// 1. Dapatkan indeks giliran dari mesin matematika (Thread-Safe)
+	idx := rrBalancer.NextIndex(totalNodes)
+	selectedNode := p.nodes[idx]
+
+	// 2. Rangkai log agar SAMA PERSIS dengan format Fuzzy
+	var detailLog string
+
+	for _, node := range p.nodes {
+		// Kunci node secara individu (hanya untuk baca)
+		node.mutex.RLock()
+		cpu := node.CPUUsage
+		queue := node.LoadAverage * 10
+		lat := node.ResponseTime
+		node.mutex.RUnlock() // Langsung lepas setelah baca
+
+		// Tambahkan ke string log. Skor diset 0.0000 karena RR tidak menghitung kelayakan.
+		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=0.0000] ",
+			node.Name, cpu, queue, lat)
+	}
+
+	// Cetak satu baris log komprehensif untuk disedot oleh Python
+	log.Printf("[DECISION] %s==> TERPILIH: %s\n", detailLog, selectedNode.Name)
+
+	return selectedNode
+}
 
 func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
 	var bestNode *Node
@@ -225,9 +259,11 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 	}
 
 	proxy := &httputil.ReverseProxy{
-		Transport: customTransport, // 2. Pasang transport ini ke proxy Anda
+		Transport: customTransport,
 		Director: func(req *http.Request) {
-			backendNode := pool.selectBackend_F_PSO_Framework()
+
+			// backendNode := pool.selectBackend_F_PSO_Framework()
+			backendNode := pool.selectBackend_RoundRobin()
 
 			if backendNode == nil {
 				log.Println("Gagal memilih backend, tidak ada node tersedia.")
@@ -242,9 +278,6 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 		},
 
 		ModifyResponse: func(res *http.Response) error {
-			// log.Println()
-			// log.Printf("[MONITOR] Menerima response %d dari %s\n", res.StatusCode, res.Request.URL.Host)
-			// log.Println()
 			return nil
 		},
 
