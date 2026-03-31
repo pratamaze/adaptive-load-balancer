@@ -11,12 +11,12 @@ var MF_out = map[string]Triple{
 
 // CalculateMamdani menghitung skor akhir node berdasarkan metrik
 func CalculateMamdani(node NodeMetrics, rules []Rule) float64 {
-	// 2-4: Fuzzifikasi Inputs
+	// Fuzzifikasi Inputs
 	muCPU := GetCPULevel(node.CPU)
 	muQueue := GetQueueLevel(node.QueueLength)
 	muResp := GetRespLevel(node.RespTime)
 
-	// 5-11: Rule Evaluation (Cari Alpha-Cut menggunakan MIN)
+	// Rule Evaluation (Cari Alpha-Cut menggunakan MIN)
 	type alphaRule struct {
 		alpha float64
 		label string
@@ -24,7 +24,7 @@ func CalculateMamdani(node NodeMetrics, rules []Rule) float64 {
 	var alphaRules []alphaRule
 
 	for _, r := range rules {
-		// Langkah 8: Alpha = Min(μ_cpu, μ_queue, μ_resp)
+		// Alpha = Min(μ_cpu, μ_queue, μ_resp)
 		alpha := math.Min(muCPU[r.CPULabel],
 			math.Min(muQueue[r.QueueLabel], muResp[r.RespLabel]))
 
@@ -33,7 +33,7 @@ func CalculateMamdani(node NodeMetrics, rules []Rule) float64 {
 		}
 	}
 
-	// 12-15: Aggregation (Cari Alpha Maksimal untuk setiap Label Output)
+	// Aggregation (Cari Alpha Maksimal untuk setiap Label Output)
 	alphaOut := make(map[string]float64)
 	for lbl := range MF_out {
 		maxA := 0.0
@@ -45,7 +45,7 @@ func CalculateMamdani(node NodeMetrics, rules []Rule) float64 {
 		alphaOut[lbl] = maxA
 	}
 
-	// 16-25: Defuzzification (Moment / Area)
+	// Defuzzification (Moment / Area)
 	var aTotal, mTotal float64
 	for lbl, t := range MF_out {
 		alpha := alphaOut[lbl]

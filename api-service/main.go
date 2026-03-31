@@ -18,7 +18,6 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 )
 
-// Global variable untuk menyimpan nama node dari flag
 var nodeName string
 
 type ResponseData struct {
@@ -37,10 +36,10 @@ type NodeMetrics struct {
 
 // HANDLER METRIK
 func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
-	// Beri tahu gopsutil untuk membaca dari /host/proc (jika di dalam Docker)
+
 	os.Setenv("HOST_PROC", "/host/proc")
 
-	//  Dapatkan CPU Usage (non-blocking)
+	//  CPU Usage (non-blocking)
 	cpuPercent, err := cpu.Percent(0, false)
 	if err != nil {
 		log.Printf("Error getting cpu: %v", err)
@@ -48,7 +47,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
 		return
 	}
 
-	//  Dapatkan Memory Usage
+	//  Memory Usage
 	vm, err := mem.VirtualMemory()
 	if err != nil {
 		log.Printf("Error getting mem: %v", err)
@@ -56,7 +55,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
 		return
 	}
 
-	//  Dapatkan Load Average
+	//  Load Average
 	loadAvg, err := load.Avg()
 	if err != nil {
 		log.Printf("Error getting load: %v", err)
@@ -64,7 +63,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
 		return
 	}
 
-	// Buat respons metrik
+	// respons metrik
 	metrics := NodeMetrics{
 		NodeName:     name,
 		CPUUsage:     cpuPercent[0],
@@ -76,8 +75,6 @@ func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
 	json.NewEncoder(w).Encode(metrics)
 }
 
-//  HANDLER SIMULASI BEBAN (UNTUK LOAD TESTING JMETER)
-
 // POST /process -> Simulasi Upload & Komputasi Kriptografi (CPU Bound)
 func dataProcessHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -87,7 +84,7 @@ func dataProcessHandler(w http.ResponseWriter, r *http.Request) {
 
 	startTime := time.Now()
 
-	// Baca data yang dikirim JMeter
+	// Baca data dari load generator
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Gagal membaca body", http.StatusInternalServerError)
@@ -150,7 +147,7 @@ func main() {
 	port := "8080"
 	log.Printf("Starting API Service di port %s dengan nama: %s\n", port, nodeName)
 
-	// 1. Route Root
+	// Route Root
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		data := ResponseData{
 			Message:   fmt.Sprintf("Request %s berhasil ditangani", r.Method),
@@ -163,12 +160,12 @@ func main() {
 		json.NewEncoder(w).Encode(data)
 	})
 
-	// 2. Route Metrik
+	// Route Metrik
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metricsHandler(w, r, nodeName)
 	})
 
-	// 3. Route Pengujian CPU (Untuk JMeter)
+	// Route Pengujian CPU (Untuk JMeter)
 	http.HandleFunc("/process", dataProcessHandler)
 	http.HandleFunc("/fetch", dataFetchHandler)
 

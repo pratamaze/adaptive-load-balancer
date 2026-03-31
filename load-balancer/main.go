@@ -8,7 +8,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
+
+	// "os"
 	"sync"
 	"time"
 
@@ -27,17 +28,19 @@ type NodeMetrics struct {
 	LoadAverage1 float64 `json:"load_average_1"`
 }
 
-// Node merepresentasikan backend service
+// backend service
 type Node struct {
 	Name string
 	URL  *url.URL
-	// Field metrik untuk F-PSO, dilindungi oleh Mutex
+
+	// Field metrik untuk F-PSO
 	CPUUsage     float64
 	LoadAverage  float64
 	MemoryUsage  float64
 	ResponseTime float64
 
-	mutex sync.RWMutex // Melindungi field metrik di atas
+	// lock field metrics
+	mutex sync.RWMutex
 }
 
 // NodePool menampung node-node backend
@@ -47,9 +50,8 @@ type NodePool struct {
 }
 
 // 27 rules
-// 27 Aturan Lengkap F-PSO Load Balancer
 var myRules = []fuzzy.Rule{
-	// --- KONDISI CPU RENDAH ---
+	// CPU RENDAH
 	{CPULabel: "Rendah", QueueLabel: "Rendah", RespLabel: "Cepat", OutputLabel: "Tinggi"},
 	{CPULabel: "Rendah", QueueLabel: "Rendah", RespLabel: "Normal", OutputLabel: "Tinggi"},
 	{CPULabel: "Rendah", QueueLabel: "Rendah", RespLabel: "Lambat", OutputLabel: "Sedang"},
@@ -60,7 +62,7 @@ var myRules = []fuzzy.Rule{
 	{CPULabel: "Rendah", QueueLabel: "Tinggi", RespLabel: "Normal", OutputLabel: "Sedang"},
 	{CPULabel: "Rendah", QueueLabel: "Tinggi", RespLabel: "Lambat", OutputLabel: "Rendah"},
 
-	// --- KONDISI CPU SEDANG ---
+	// CPU SEDANG
 	{CPULabel: "Sedang", QueueLabel: "Rendah", RespLabel: "Cepat", OutputLabel: "Tinggi"},
 	{CPULabel: "Sedang", QueueLabel: "Rendah", RespLabel: "Normal", OutputLabel: "Sedang"},
 	{CPULabel: "Sedang", QueueLabel: "Rendah", RespLabel: "Lambat", OutputLabel: "Sedang"},
@@ -71,7 +73,7 @@ var myRules = []fuzzy.Rule{
 	{CPULabel: "Sedang", QueueLabel: "Tinggi", RespLabel: "Normal", OutputLabel: "Rendah"},
 	{CPULabel: "Sedang", QueueLabel: "Tinggi", RespLabel: "Lambat", OutputLabel: "Rendah"},
 
-	// --- KONDISI CPU TINGGI ---
+	// CPU TINGGI
 	{CPULabel: "Tinggi", QueueLabel: "Rendah", RespLabel: "Cepat", OutputLabel: "Sedang"},
 	{CPULabel: "Tinggi", QueueLabel: "Rendah", RespLabel: "Normal", OutputLabel: "Sedang"},
 	{CPULabel: "Tinggi", QueueLabel: "Rendah", RespLabel: "Lambat", OutputLabel: "Rendah"},
@@ -83,8 +85,7 @@ var myRules = []fuzzy.Rule{
 	{CPULabel: "Tinggi", QueueLabel: "Tinggi", RespLabel: "Lambat", OutputLabel: "Rendah"},
 }
 
-// getRealNodeMetrics mengambil data dari endpoint /metrics dan mengupdate SATU node
-// Fungsi ini dipanggil oleh background collector
+// paralel per node
 func (p *NodePool) getRealNodeMetrics(node *Node) {
 	metricsURL := node.URL.String() + "/metrics"
 	startTime := time.Now()
@@ -92,23 +93,23 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 	req, _ := http.NewRequest("GET", metricsURL, nil)
 	resp, err := p.client.Do(req)
 
-	responseTime := time.Since(startTime).Seconds() * 1000 // dalam ms
+	// respontime dalam ms
+	responseTime := time.Since(startTime).Seconds() * 1000
 
-	// --- Gunakan Lock (Write Lock) ---
+	// Write Lock
 	node.mutex.Lock()
 	defer node.mutex.Unlock()
 
-	// Jika GAGAL (node mati, timeout, dll.)
+	// penalti
 	if err != nil {
 		log.Printf("[METRIC] Gagal mengambil metrik dari %s: %v\n", node.Name, err)
-		// Beri penalti agar tidak dipilih oleh F-PSO
-		node.CPUUsage = 100.0       // Set CPU ke max
-		node.ResponseTime = 99999.0 // Set latensi ke max
+		node.CPUUsage = 100.0
+		node.ResponseTime = 99999.0
 		return
 	}
 	defer resp.Body.Close()
 
-	// Jika SUKSESshut
+	// sukses
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("[METRIC] Gagal membaca body dari %s: %v\n", node.Name, err)
@@ -121,7 +122,7 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 		return
 	}
 
-	// Update metrik di node
+	// Update metrik node
 	node.CPUUsage = metrics.CPUUsage
 	node.LoadAverage = metrics.LoadAverage1
 	node.MemoryUsage = metrics.MemoryUsage
@@ -135,9 +136,7 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 		node.Name, node.CPUUsage, node.LoadAverage, node.ResponseTime)
 }
 
-// --- FUNGSI BARU UNTUK BACKGROUND COLLECTOR ---
-
-// updateAllMetrics memicu update paralel ke SEMUA node
+// update paralel ke SEMUA node
 func (p *NodePool) updateAllMetrics() {
 	var wg sync.WaitGroup
 	for _, node := range p.nodes {
@@ -150,14 +149,11 @@ func (p *NodePool) updateAllMetrics() {
 	wg.Wait()
 }
 
-// startMetricsCollector memulai goroutine di background untuk mengambil metrik
+// goroutine di background untuk mengambil metrik
 func (p *NodePool) startMetricsCollector(interval time.Duration) {
 	log.Printf("[METRIC-COLLECTOR] Memulai kolektor metrik (setiap %s)\n", interval)
-
-	// Jalankan satu kali di awal agar data tidak kosong saat server baru menyala
 	p.updateAllMetrics()
 
-	// Jalankan ticker di goroutine terpisah
 	go func() {
 		ticker := time.NewTicker(interval)
 		for range ticker.C {
@@ -176,27 +172,26 @@ func (p *NodePool) selectBackend_RoundRobin() *Node {
 		return nil
 	}
 
-	// 1. Dapatkan indeks giliran dari mesin matematika (Thread-Safe)
+	// Thread-Safe
 	idx := rrBalancer.NextIndex(totalNodes)
 	selectedNode := p.nodes[idx]
 
-	// 2. Rangkai log agar SAMA PERSIS dengan format Fuzzy
+	// log
 	var detailLog string
 
 	for _, node := range p.nodes {
-		// Kunci node secara individu (hanya untuk baca)
 		node.mutex.RLock()
 		cpu := node.CPUUsage
 		queue := node.LoadAverage * 10
 		lat := node.ResponseTime
-		node.mutex.RUnlock() // Langsung lepas setelah baca
+		node.mutex.RUnlock()
 
-		// Tambahkan ke string log. Skor diset 0.0000 karena RR tidak menghitung kelayakan.
+		// Skor diset 0.0000 karena RR tidak menghitung kelayakan.
 		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=0.0000] ",
 			node.Name, cpu, queue, lat)
 	}
 
-	// Cetak satu baris log komprehensif untuk disedot oleh Python
+	// log komprehensif untuk evaluasi kinerja Python
 	log.Printf("[DECISION] %s==> TERPILIH: %s\n", detailLog, selectedNode.Name)
 
 	return selectedNode
@@ -246,13 +241,14 @@ func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
 	return bestNode
 }
 
-// newReverseProxy membuat instance reverse proxy
+// instance reverse proxy
 func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 
+	// custom for performance
 	customTransport := &http.Transport{
 		MaxIdleConns:          10000, // Total koneksi keseluruhan
 		MaxIdleConnsPerHost:   5000,  // Batas koneksi nganggur per backend
-		MaxConnsPerHost:       5000,  // Batas koneksi aktif per backend
+		MaxConnsPerHost:       0,     // Batas koneksi aktif per backend
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -316,30 +312,15 @@ func init() {
 
 func main() {
 
-	// --- TAMBAHAN UNTUK MENYIMPAN LOG KE FILE ---
-	// Membuat folder /logs jika belum ada
-	os.MkdirAll("/logs", os.ModePerm)
-
-	// Membuka atau membuat file pso_evaluation.log
-	logFile, err := os.OpenFile("/logs/pso_evaluation.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatalf("Gagal membuka file log: %v", err)
-	}
-	defer logFile.Close()
-
-	// Log muncul di terminal DAN ditulis ke file
-	multiWriter := io.MultiWriter(os.Stdout, logFile)
-	log.SetOutput(multiWriter)
-
 	// Inisialisasi daftar Node
 	backendDNS := []string{
 		"http://api-node1:8080",
 		"http://api-node2:8080",
 	}
 
-	//  HTTP client khusus untuk metrik
+	//  HTTP client untuk metrik Timeout 0.5 detik
 	metricsClient := &http.Client{
-		Timeout: 500 * time.Millisecond, // Timeout 0.5 detik (lebih cepat dari interval)
+		Timeout: 500 * time.Millisecond,
 	}
 
 	pool := &NodePool{client: metricsClient}
@@ -357,24 +338,16 @@ func main() {
 		log.Printf("Mendaftarkan backend node: %s di %s\n", nodeName, backendURL)
 	}
 
-	// --- PERUBAHAN KRUSIAL ---
-	// Jalankan kolektor metrik di background.
-	// Metrik akan di-update setiap
+	// kolektor metrik di background (update setiap 500 ms).
 	pool.startMetricsCollector(500 * time.Millisecond)
-	// -------------------------
 
-	// 1. Inisialisasi Mux
 	mux := http.NewServeMux()
-
-	// Gunakan full path agar tidak tertukar
 	mux.Handle("/metrics", promhttp.Handler())
 
-	// 3. Buat handler untuk proxy
 	proxy := newReverseProxy(pool)
 
-	//  HandleFunc untuk "/" tapi beri pengecekan manual
+	// metrics handler
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Jika request datang ke /metrics tapi tidak sengaja masuk ke sini
 		if r.URL.Path == "/metrics" {
 			promhttp.Handler().ServeHTTP(w, r)
 			return
@@ -385,7 +358,7 @@ func main() {
 
 	log.Println("Memulai Load Balancer di port :8080...")
 
-	//  konfigurasi server dengan timeout agar tidak hang selamanya
+	//  konfigurasi server dengan timeout
 	server := &http.Server{
 		Addr:         ":8080",
 		Handler:      mux,
