@@ -248,7 +248,7 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 	customTransport := &http.Transport{
 		MaxIdleConns:          10000, // Total koneksi keseluruhan
 		MaxIdleConnsPerHost:   5000,  // Batas koneksi nganggur per backend
-		MaxConnsPerHost:       0,     // Batas koneksi aktif per backend
+		MaxConnsPerHost:       15000, // Batas koneksi aktif per backend
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
