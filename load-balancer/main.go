@@ -5,12 +5,19 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+
+	// "os"
 	"sync"
 	"time"
+
+	"load-balancer/pkg/fuzzy"
+	"load-balancer/pkg/roundrobin"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Harus sama dengan yang ada di api-service
@@ -21,17 +28,19 @@ type NodeMetrics struct {
 	LoadAverage1 float64 `json:"load_average_1"`
 }
 
-// Node merepresentasikan backend service
+// backend service
 type Node struct {
 	Name string
 	URL  *url.URL
-	// Field metrik untuk F-PSO, dilindungi oleh Mutex
+
+	// Field metrik untuk F-PSO
 	CPUUsage     float64
 	LoadAverage  float64
 	MemoryUsage  float64
 	ResponseTime float64
 
-	mutex sync.RWMutex // Melindungi field metrik di atas
+	// lock field metrics
+	mutex sync.RWMutex
 }
 
 // NodePool menampung node-node backend
@@ -40,8 +49,43 @@ type NodePool struct {
 	client *http.Client // HTTP client khusus untuk memanggil /metrics
 }
 
-// getRealNodeMetrics mengambil data dari endpoint /metrics dan mengupdate SATU node
-// Fungsi ini dipanggil oleh background collector
+// 27 rules
+var myRules = []fuzzy.Rule{
+	// CPU RENDAH
+	{CPULabel: "Rendah", QueueLabel: "Rendah", RespLabel: "Cepat", OutputLabel: "Tinggi"},
+	{CPULabel: "Rendah", QueueLabel: "Rendah", RespLabel: "Normal", OutputLabel: "Tinggi"},
+	{CPULabel: "Rendah", QueueLabel: "Rendah", RespLabel: "Lambat", OutputLabel: "Sedang"},
+	{CPULabel: "Rendah", QueueLabel: "Sedang", RespLabel: "Cepat", OutputLabel: "Tinggi"},
+	{CPULabel: "Rendah", QueueLabel: "Sedang", RespLabel: "Normal", OutputLabel: "Sedang"},
+	{CPULabel: "Rendah", QueueLabel: "Sedang", RespLabel: "Lambat", OutputLabel: "Sedang"},
+	{CPULabel: "Rendah", QueueLabel: "Tinggi", RespLabel: "Cepat", OutputLabel: "Sedang"},
+	{CPULabel: "Rendah", QueueLabel: "Tinggi", RespLabel: "Normal", OutputLabel: "Sedang"},
+	{CPULabel: "Rendah", QueueLabel: "Tinggi", RespLabel: "Lambat", OutputLabel: "Rendah"},
+
+	// CPU SEDANG
+	{CPULabel: "Sedang", QueueLabel: "Rendah", RespLabel: "Cepat", OutputLabel: "Tinggi"},
+	{CPULabel: "Sedang", QueueLabel: "Rendah", RespLabel: "Normal", OutputLabel: "Sedang"},
+	{CPULabel: "Sedang", QueueLabel: "Rendah", RespLabel: "Lambat", OutputLabel: "Sedang"},
+	{CPULabel: "Sedang", QueueLabel: "Sedang", RespLabel: "Cepat", OutputLabel: "Sedang"},
+	{CPULabel: "Sedang", QueueLabel: "Sedang", RespLabel: "Normal", OutputLabel: "Sedang"},
+	{CPULabel: "Sedang", QueueLabel: "Sedang", RespLabel: "Lambat", OutputLabel: "Rendah"},
+	{CPULabel: "Sedang", QueueLabel: "Tinggi", RespLabel: "Cepat", OutputLabel: "Sedang"},
+	{CPULabel: "Sedang", QueueLabel: "Tinggi", RespLabel: "Normal", OutputLabel: "Rendah"},
+	{CPULabel: "Sedang", QueueLabel: "Tinggi", RespLabel: "Lambat", OutputLabel: "Rendah"},
+
+	// CPU TINGGI
+	{CPULabel: "Tinggi", QueueLabel: "Rendah", RespLabel: "Cepat", OutputLabel: "Sedang"},
+	{CPULabel: "Tinggi", QueueLabel: "Rendah", RespLabel: "Normal", OutputLabel: "Sedang"},
+	{CPULabel: "Tinggi", QueueLabel: "Rendah", RespLabel: "Lambat", OutputLabel: "Rendah"},
+	{CPULabel: "Tinggi", QueueLabel: "Sedang", RespLabel: "Cepat", OutputLabel: "Sedang"},
+	{CPULabel: "Tinggi", QueueLabel: "Sedang", RespLabel: "Normal", OutputLabel: "Rendah"},
+	{CPULabel: "Tinggi", QueueLabel: "Sedang", RespLabel: "Lambat", OutputLabel: "Rendah"},
+	{CPULabel: "Tinggi", QueueLabel: "Tinggi", RespLabel: "Cepat", OutputLabel: "Rendah"},
+	{CPULabel: "Tinggi", QueueLabel: "Tinggi", RespLabel: "Normal", OutputLabel: "Rendah"},
+	{CPULabel: "Tinggi", QueueLabel: "Tinggi", RespLabel: "Lambat", OutputLabel: "Rendah"},
+}
+
+// paralel per node
 func (p *NodePool) getRealNodeMetrics(node *Node) {
 	metricsURL := node.URL.String() + "/metrics"
 	startTime := time.Now()
@@ -49,23 +93,23 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 	req, _ := http.NewRequest("GET", metricsURL, nil)
 	resp, err := p.client.Do(req)
 
-	responseTime := time.Since(startTime).Seconds() * 1000 // dalam ms
+	// respontime dalam ms
+	responseTime := time.Since(startTime).Seconds() * 1000
 
-	// --- Gunakan Lock (Write Lock) ---
+	// Write Lock
 	node.mutex.Lock()
 	defer node.mutex.Unlock()
 
-	// Jika GAGAL (node mati, timeout, dll.)
+	// penalti
 	if err != nil {
 		log.Printf("[METRIC] Gagal mengambil metrik dari %s: %v\n", node.Name, err)
-		// Beri penalti agar tidak dipilih oleh F-PSO
-		node.CPUUsage = 100.0       // Set CPU ke max
-		node.ResponseTime = 99999.0 // Set latensi ke max
+		node.CPUUsage = 100.0
+		node.ResponseTime = 99999.0
 		return
 	}
 	defer resp.Body.Close()
 
-	// Jika SUKSESshut
+	// sukses
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("[METRIC] Gagal membaca body dari %s: %v\n", node.Name, err)
@@ -78,19 +122,21 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 		return
 	}
 
-	// Update metrik di node
+	// Update metrik node
 	node.CPUUsage = metrics.CPUUsage
 	node.LoadAverage = metrics.LoadAverage1
 	node.MemoryUsage = metrics.MemoryUsage
 	node.ResponseTime = responseTime // Waktu respon real dari panggilan /metrics
 
+	// Kirim data terbaru ke Prometheus Exporter
+	cpuGauge.WithLabelValues(node.Name).Set(metrics.CPUUsage)
+	latencyGauge.WithLabelValues(node.Name).Set(responseTime)
+
 	log.Printf("[METRIC] Node %s: CPU=%.2f%%, Load=%.2f, Latency=%.2fms\n",
 		node.Name, node.CPUUsage, node.LoadAverage, node.ResponseTime)
 }
 
-// --- FUNGSI BARU UNTUK BACKGROUND COLLECTOR ---
-
-// updateAllMetrics memicu update paralel ke SEMUA node
+// update paralel ke SEMUA node
 func (p *NodePool) updateAllMetrics() {
 	var wg sync.WaitGroup
 	for _, node := range p.nodes {
@@ -103,14 +149,11 @@ func (p *NodePool) updateAllMetrics() {
 	wg.Wait()
 }
 
-// startMetricsCollector memulai goroutine di background untuk mengambil metrik
+// goroutine di background untuk mengambil metrik
 func (p *NodePool) startMetricsCollector(interval time.Duration) {
 	log.Printf("[METRIC-COLLECTOR] Memulai kolektor metrik (setiap %s)\n", interval)
-
-	// Jalankan satu kali di awal agar data tidak kosong saat server baru menyala
 	p.updateAllMetrics()
 
-	// Jalankan ticker di goroutine terpisah
 	go func() {
 		ticker := time.NewTicker(interval)
 		for range ticker.C {
@@ -121,66 +164,102 @@ func (p *NodePool) startMetricsCollector(interval time.Duration) {
 	}()
 }
 
-// --- FUNGSI SELEKSI DIPERBARUI ---
+var rrBalancer = roundrobin.New()
 
-// selectBackend_F_PSO_Framework kini HANYA MEMBACA metrik, super cepat!
-func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
-	// Fungsi ini tidak lagi mengambil metrik, hanya membaca dari memori.
-	// Ini membuatnya sangat cepat dan tidak menambah latensi pada request user.
+func (p *NodePool) selectBackend_RoundRobin() *Node {
+	totalNodes := len(p.nodes)
+	if totalNodes == 0 {
+		return nil
+	}
 
-	var bestNode *Node
-	minCPU := math.MaxFloat64 // Nanti ganti dengan logika F-PSO Anda
+	// Thread-Safe
+	idx := rrBalancer.NextIndex(totalNodes)
+	selectedNode := p.nodes[idx]
 
-	// --- DI SINILAH LOGIKA F-PSO ANDA AKAN DITEMPATKAN ---
-	// Iterasi semua node dan baca metriknya
+	// log
+	var detailLog string
+
 	for _, node := range p.nodes {
-		// --- Gunakan RLock (Read Lock) ---
 		node.mutex.RLock()
-		// Ambil metrik yang sudah di-update oleh background collector
-		currentCPU := node.CPUUsage
-		// currentLoad := node.LoadAverage
-		// currentLatency := node.ResponseTime
+		cpu := node.CPUUsage
+		queue := node.LoadAverage * 10
+		lat := node.ResponseTime
 		node.mutex.RUnlock()
-		// --- Selesai RLock ---
 
-		// (Contoh logika: Pilih CPU terendah)
-		if currentCPU < minCPU {
-			minCPU = currentCPU
+		// Skor diset 0.0000 karena RR tidak menghitung kelayakan.
+		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=0.0000] ",
+			node.Name, cpu, queue, lat)
+	}
+
+	// log komprehensif untuk evaluasi kinerja Python
+	log.Printf("[DECISION] %s==> TERPILIH: %s\n", detailLog, selectedNode.Name)
+
+	return selectedNode
+}
+
+func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
+	var bestNode *Node
+	maxScore := -1.0
+
+	// Variabel string untuk merangkum detail perhitungan semua node
+	var detailLog string
+
+	for _, node := range p.nodes {
+		node.mutex.RLock()
+		metrics := fuzzy.NodeMetrics{
+			CPU:         node.CPUUsage,
+			QueueLength: node.LoadAverage * 10,
+			RespTime:    node.ResponseTime,
+		}
+		node.mutex.RUnlock()
+
+		score := fuzzy.CalculateMamdani(metrics, myRules)
+
+		// Rangkum hitungan eksak ke dalam string
+		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=%.4f] ",
+			node.Name, metrics.CPU, metrics.QueueLength, metrics.RespTime, score)
+
+		if score > maxScore {
+			maxScore = score
 			bestNode = node
-		}
-	}
-	// --- AKHIR DARI LOGIKA F-PSO ---
+		} else if score == maxScore && bestNode != nil {
+			node.mutex.RLock()
+			bestNodeCPU := bestNode.CPUUsage
+			node.mutex.RUnlock()
 
-	if bestNode == nil {
-		log.Println("[F-PSO] Peringatan: Tidak ada node yang valid, kembali ke node pertama.")
-		if len(p.nodes) > 0 {
-			bestNode = p.nodes[0] // Fallback
-		} else {
-			log.Println("[F-PSO] Error: Tidak ada node di pool!")
-			return nil // Seharusnya tidak terjadi
+			if metrics.CPU < bestNodeCPU {
+				bestNode = node
+			}
 		}
 	}
 
-	log.Printf("[F-PSO] Logika F-PSO memilih Node: %s (Metrik: CPU %.2f%%)\n", bestNode.Name, minCPU)
+	if bestNode != nil {
+		// Cetak satu baris log komprehensif untuk bukti pengujian
+		log.Printf("[DECISION] %s ==> TERPILIH: %s\n", detailLog, bestNode.Name)
+	}
+
 	return bestNode
 }
 
-// newReverseProxy membuat instance reverse proxy
+// instance reverse proxy
 func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 
+	// custom for performance
 	customTransport := &http.Transport{
 		MaxIdleConns:          10000, // Total koneksi keseluruhan
 		MaxIdleConnsPerHost:   5000,  // Batas koneksi nganggur per backend
-		MaxConnsPerHost:       5000,  // Batas koneksi aktif per backend
+		MaxConnsPerHost:       15000, // Batas koneksi aktif per backend
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
 	proxy := &httputil.ReverseProxy{
-		Transport: customTransport, // 2. Pasang transport ini ke proxy Anda
+		Transport: customTransport,
 		Director: func(req *http.Request) {
-			backendNode := pool.selectBackend_F_PSO_Framework()
+
+			// backendNode := pool.selectBackend_F_PSO_Framework()
+			backendNode := pool.selectBackend_RoundRobin()
 
 			if backendNode == nil {
 				log.Println("Gagal memilih backend, tidak ada node tersedia.")
@@ -195,9 +274,6 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 		},
 
 		ModifyResponse: func(res *http.Response) error {
-			log.Println()
-			log.Printf("[MONITOR] Menerima response %d dari %s\n", res.StatusCode, res.Request.URL.Host)
-			log.Println()
 			return nil
 		},
 
@@ -209,17 +285,42 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 	return proxy
 }
 
+var (
+	// Wadah untuk metrik CPU per node
+	cpuGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pso_node_cpu_usage",
+			Help: "Penggunaan CPU node backend (%)",
+		},
+		[]string{"node_name"},
+	)
+	// Wadah untuk metrik Latensi per node
+	latencyGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pso_node_latency_ms",
+			Help: "Latensi komunikasi ke node (ms)",
+		},
+		[]string{"node_name"},
+	)
+)
+
+func init() {
+	// Mendaftarkan metrik ke sistem Prometheus
+	prometheus.MustRegister(cpuGauge)
+	prometheus.MustRegister(latencyGauge)
+}
+
 func main() {
+
 	// Inisialisasi daftar Node
 	backendDNS := []string{
 		"http://api-node1:8080",
 		"http://api-node2:8080",
-		// Tambahkan node lain di sini jika perlu
 	}
 
-	// Buat HTTP client khusus untuk metrik
+	//  HTTP client untuk metrik Timeout 0.5 detik
 	metricsClient := &http.Client{
-		Timeout: 500 * time.Millisecond, // Timeout 0.5 detik (lebih cepat dari interval)
+		Timeout: 500 * time.Millisecond,
 	}
 
 	pool := &NodePool{client: metricsClient}
@@ -237,18 +338,35 @@ func main() {
 		log.Printf("Mendaftarkan backend node: %s di %s\n", nodeName, backendURL)
 	}
 
-	// --- PERUBAHAN KRUSIAL ---
-	// Jalankan kolektor metrik di background.
-	// Metrik akan di-update setiap 2 detik.
+	// kolektor metrik di background (update setiap 500 ms).
 	pool.startMetricsCollector(500 * time.Millisecond)
-	// -------------------------
 
-	// Membuat reverse proxy
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
 	proxy := newReverseProxy(pool)
 
-	log.Println("Memulai Load Balancer F-PSO (Mode Asinkron) di port :8080...")
-	// Jalankan server proxy
-	if err := http.ListenAndServe(":8080", proxy); err != nil {
-		log.Fatalf("Gagal memulai server proxy: %v", err)
+	// metrics handler
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			promhttp.Handler().ServeHTTP(w, r)
+			return
+		}
+		// Jalankan proxy untuk trafik lainnya
+		proxy.ServeHTTP(w, r)
+	})
+
+	log.Println("Memulai Load Balancer di port :8080...")
+
+	//  konfigurasi server dengan timeout
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("Gagal memulai server: %v", err)
 	}
 }
