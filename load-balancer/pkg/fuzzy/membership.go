@@ -1,25 +1,20 @@
 package fuzzy
 
-// Fuzzify menghitung derajat keanggotaan berdasarkan kurva segitiga
-// Fuzzify menghitung derajat keanggotaan berdasarkan kurva segitiga
+// Triangulas Membership function
 func Fuzzify(val float64, mf Triple) float64 {
-	// 1. CEK PUNCAK DULU: Harus mengembalikan nilai 1
 	if val == mf.B {
 		return 1.0
 	}
-	// 2. CEK BATAS LUAR: Jika nilai di luar kurva segitiga
 	if val <= mf.A || val >= mf.C {
 		return 0.0
 	}
-	// 3. KEMIRINGAN NAIK
 	if val < mf.B {
 		return (val - mf.A) / (mf.B - mf.A)
 	}
-	// 4. KEMIRINGAN TURUN
 	return (mf.C - val) / (mf.C - mf.B)
 }
 
-// Mendapatkan level derajat untuk CPU (0-100%)
+// derajat CPU (0-100%)
 func GetCPULevel(val float64) map[string]float64 {
 	return map[string]float64{
 		"Rendah": Fuzzify(val, Triple{0, 0, 50}),
@@ -28,7 +23,7 @@ func GetCPULevel(val float64) map[string]float64 {
 	}
 }
 
-// Mendapatkan level derajat untuk Queue (0-1000 req)
+// derajat Queue (0-1000 req)
 func GetQueueLevel(val float64) map[string]float64 {
 	return map[string]float64{
 		"Rendah": Fuzzify(val, Triple{0, 0, 500}),
@@ -37,7 +32,7 @@ func GetQueueLevel(val float64) map[string]float64 {
 	}
 }
 
-// Mendapatkan level derajat untuk Response Time (0-1000ms)
+// derajat Response Time (0-1000ms)
 func GetRespLevel(val float64) map[string]float64 {
 	return map[string]float64{
 		"Cepat":  Fuzzify(val, Triple{0, 0, 500}),
