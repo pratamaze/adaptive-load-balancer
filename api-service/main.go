@@ -13,12 +13,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/load"
-	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/shirou/gopsutil/v3/process" // Package baru untuk metrik spesifik container
 )
 
 var nodeName string
+var myProcess *process.Process
+
+// Inisialisasi proses Golang ini sebagai target pantauan CCTV (hanya jalan sekali)
+func init() {
+	var err error
+	myProcess, err = process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		log.Printf("[WARNING] Gagal inisialisasi pembaca metrik Container: %v", err)
+	}
+}
 
 type ResponseData struct {
 	Message   string `json:"message"`
@@ -36,39 +45,42 @@ type NodeMetrics struct {
 
 // HANDLER METRIK
 func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
+	// HOST_PROC sudah dihapus agar tidak bocor ke host OS
 
-	os.Setenv("HOST_PROC", "/host/proc")
+	var cpuUsage float64
+	var memUsage float32
 
-	//  CPU Usage (non-blocking)
-	cpuPercent, err := cpu.Percent(0, false)
-	if err != nil {
-		log.Printf("Error getting cpu: %v", err)
-		http.Error(w, "Failed to get CPU", http.StatusInternalServerError)
-		return
+	if myProcess != nil {
+		// 1. CPU Usage murni milik container ini
+		cpuVal, err := myProcess.Percent(0)
+		if err == nil {
+			cpuUsage = cpuVal
+			// Batasi maksimal 100% agar logika Fuzzy-PSO di Load Balancer tidak rusak
+			if cpuUsage > 100.0 {
+				cpuUsage = 100.0
+			}
+		}
+
+		// 2. Memory Usage murni milik container ini
+		memVal, err := myProcess.MemoryPercent()
+		if err == nil {
+			memUsage = memVal
+		}
 	}
 
-	//  Memory Usage
-	vm, err := mem.VirtualMemory()
-	if err != nil {
-		log.Printf("Error getting mem: %v", err)
-		http.Error(w, "Failed to get Memory", http.StatusInternalServerError)
-		return
-	}
-
-	//  Load Average
+	// 3. Load Average
+	loadAvg1 := 0.0
 	loadAvg, err := load.Avg()
-	if err != nil {
-		log.Printf("Error getting load: %v", err)
-		http.Error(w, "Failed to get Load", http.StatusInternalServerError)
-		return
+	if err == nil {
+		loadAvg1 = loadAvg.Load1
 	}
 
 	// respons metrik
 	metrics := NodeMetrics{
 		NodeName:     name,
-		CPUUsage:     cpuPercent[0],
-		MemoryUsage:  vm.UsedPercent,
-		LoadAverage1: loadAvg.Load1,
+		CPUUsage:     cpuUsage,
+		MemoryUsage:  float64(memUsage),
+		LoadAverage1: loadAvg1,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -139,7 +151,6 @@ func dataFetchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-
 	nName := flag.String("name", "API-NODE-UNKNOWN", "Nama unik untuk instance API node ini")
 	flag.Parse()
 	nodeName = *nName
