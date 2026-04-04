@@ -8,17 +8,23 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 
 	// "os"
+	// "encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"load-balancer/pkg/fuzzy"
+	"load-balancer/pkg/pso"
 	"load-balancer/pkg/roundrobin"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+var lastRequestTime atomic.Int64
 
 // Harus sama dengan yang ada di api-service
 type NodeMetrics struct {
@@ -84,6 +90,77 @@ var myRules = []fuzzy.Rule{
 	{CPULabel: "Tinggi", QueueLabel: "Tinggi", RespLabel: "Normal", OutputLabel: "Rendah"},
 	{CPULabel: "Tinggi", QueueLabel: "Tinggi", RespLabel: "Lambat", OutputLabel: "Rendah"},
 }
+
+// =====================================================================
+// FUNGSI PEMBANTU F-PSO (Letakkan di atas func main)
+// =====================================================================
+
+// Membaca file pso_params.json jika sudah ada
+func loadOptimizedParams(filename string, baseParams []float64) []float64 {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		log.Printf("[INFO] File %s tidak ditemukan. Menggunakan parameter Fuzzy Dasar (Statis).", filename)
+		return baseParams
+	}
+
+	var optimizedParams []float64
+	if err := json.Unmarshal(data, &optimizedParams); err != nil {
+		log.Printf("[WARNING] Gagal membaca %s. Menggunakan parameter Fuzzy Dasar.", filename)
+		return baseParams
+	}
+
+	log.Printf("[SUCCESS] Berhasil memuat 27 Parameter Adaptif F-PSO dari %s!", filename)
+	return optimizedParams
+}
+
+// Menyimpan 27 parameter gbest ke file secara real-time
+func saveParamsToFile(filename string, params []float64) {
+	file, err := os.Create(filename)
+	if err != nil {
+		log.Printf("[WARNING] Gagal membuat file konfigurasi: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(params); err != nil {
+		log.Printf("[WARNING] Gagal menulis ke file JSON: %v\n", err)
+	}
+}
+
+// Fungsi Fitness yang menggunakan data asli dari server saat itu juga
+func evaluateFitnessRealtime(params []float64, n1, n2 *Node) float64 {
+	dummyEngine := fuzzy.NewEngine(params)
+
+	// Gunakan metrik asli saat itu juga
+	score1 := dummyEngine.CalculateMamdani(fuzzy.NodeMetrics{CPU: n1.CPUUsage, QueueLength: n1.LoadAverage * 10, RespTime: n1.ResponseTime}, myRules)
+	score2 := dummyEngine.CalculateMamdani(fuzzy.NodeMetrics{CPU: n2.CPUUsage, QueueLength: n2.LoadAverage * 10, RespTime: n2.ResponseTime}, myRules)
+
+	loadDiff := n1.CPUUsage - n2.CPUUsage
+	scoreDiff := score1 - score2
+
+	return -(loadDiff * scoreDiff)
+}
+
+// =====================================================================
+
+// func main() {
+// ... (isi fungsi main kamu yang sudah benar tadi) ...
+
+// 27 Parameter Baseline ( 3 variabel x 3 label x 3 nilai A,B,C)
+var BaseFuzzyParams = []float64{
+	// CPU (Rendah, Sedang, Tinggi)
+	0, 0, 50, 0, 50, 100, 50, 100, 100,
+	// Queue (Rendah, Sedang, Tinggi)
+	0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+	// RespTime (Cepat, Normal, Lambat)
+	0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+}
+
+// DUA MESIN TERPISAH: 1 Statis (Variabel Kontrol), 1 Dinamis (Dioptimasi PSO)
+var StaticFuzzyEngine = fuzzy.NewEngine(BaseFuzzyParams)
+var AdaptiveFPSOEngine = fuzzy.NewEngine(BaseFuzzyParams)
 
 // paralel per node
 func (p *NodePool) getRealNodeMetrics(node *Node) {
@@ -164,6 +241,22 @@ func (p *NodePool) startMetricsCollector(interval time.Duration) {
 	}()
 }
 
+// evaluateFitness menilai seberapa bagus 27 angka tebakan PSO untuk menyeimbangkan beban
+func evaluateFitness(params []float64, n1, n2 *Node) float64 {
+	// Buat mesin bayangan sementara
+	dummyEngine := fuzzy.NewEngine(params)
+	score1 := dummyEngine.CalculateMamdani(fuzzy.NodeMetrics{CPU: n1.CPUUsage, QueueLength: n1.LoadAverage * 10, RespTime: n1.ResponseTime}, myRules)
+	score2 := dummyEngine.CalculateMamdani(fuzzy.NodeMetrics{CPU: n2.CPUUsage, QueueLength: n2.LoadAverage * 10, RespTime: n2.ResponseTime}, myRules)
+
+	// Jika CPU N1 lebih besar dari N2 (selisih positif), maka SKOR N1 harus lebih kecil dari N2 (selisih negatif).
+	loadDiff := n1.CPUUsage - n2.CPUUsage
+	scoreDiff := score1 - score2
+
+	// Hasil kali loadDiff dan scoreDiff harus negatif jika arahnya benar.
+	// Agar fitness makin besar makin baik, kita beri tanda minus di depannya.
+	return -(loadDiff * scoreDiff)
+}
+
 var rrBalancer = roundrobin.New()
 
 func (p *NodePool) selectBackend_RoundRobin() *Node {
@@ -197,27 +290,20 @@ func (p *NodePool) selectBackend_RoundRobin() *Node {
 	return selectedNode
 }
 
-func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
+// ALGORITMA 2: FUZZY STATIS MURNI
+func (p *NodePool) selectBackend_Fuzzy_Static() *Node {
 	var bestNode *Node
 	maxScore := -1.0
-
-	// Variabel string untuk merangkum detail perhitungan semua node
 	var detailLog string
 
 	for _, node := range p.nodes {
 		node.mutex.RLock()
-		metrics := fuzzy.NodeMetrics{
-			CPU:         node.CPUUsage,
-			QueueLength: node.LoadAverage * 10,
-			RespTime:    node.ResponseTime,
-		}
+		metrics := fuzzy.NodeMetrics{CPU: node.CPUUsage, QueueLength: node.LoadAverage * 10, RespTime: node.ResponseTime}
 		node.mutex.RUnlock()
 
-		score := fuzzy.CalculateMamdani(metrics, myRules)
-
-		// Rangkum hitungan eksak ke dalam string
-		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=%.4f] ",
-			node.Name, metrics.CPU, metrics.QueueLength, metrics.RespTime, score)
+		// PANGGIL MESIN STATIS
+		score := StaticFuzzyEngine.CalculateMamdani(metrics, myRules)
+		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=%.4f] ", node.Name, metrics.CPU, metrics.QueueLength, metrics.RespTime, score)
 
 		if score > maxScore {
 			maxScore = score
@@ -226,19 +312,93 @@ func (p *NodePool) selectBackend_F_PSO_Framework() *Node {
 			node.mutex.RLock()
 			bestNodeCPU := bestNode.CPUUsage
 			node.mutex.RUnlock()
-
 			if metrics.CPU < bestNodeCPU {
 				bestNode = node
 			}
 		}
 	}
-
 	if bestNode != nil {
-		// Cetak satu baris log komprehensif untuk bukti pengujian
-		log.Printf("[DECISION] %s ==> TERPILIH: %s\n", detailLog, bestNode.Name)
+		log.Printf("[DECISION] %s ==> TERPILIH (FUZZY): %s\n", detailLog, bestNode.Name)
 	}
-
 	return bestNode
+}
+
+// ALGORITMA 3: ADAPTIVE F-PSO (Ini boss akhirnya)
+func (p *NodePool) selectBackend_FPSO_Adaptive() *Node {
+	var bestNode *Node
+	maxScore := -1.0
+	var detailLog string
+
+	for _, node := range p.nodes {
+		node.mutex.RLock()
+		metrics := fuzzy.NodeMetrics{CPU: node.CPUUsage, QueueLength: node.LoadAverage * 10, RespTime: node.ResponseTime}
+		node.mutex.RUnlock()
+
+		// PANGGIL MESIN F-PSO
+		score := AdaptiveFPSOEngine.CalculateMamdani(metrics, myRules)
+		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=%.4f] ", node.Name, metrics.CPU, metrics.QueueLength, metrics.RespTime, score)
+
+		if score > maxScore {
+			maxScore = score
+			bestNode = node
+		} else if score == maxScore && bestNode != nil {
+			node.mutex.RLock()
+			bestNodeCPU := bestNode.CPUUsage
+			node.mutex.RUnlock()
+			if metrics.CPU < bestNodeCPU {
+				bestNode = node
+			}
+		}
+	}
+	if bestNode != nil {
+		log.Printf("[DECISION] %s ==> TERPILIH (F-PSO): %s\n", detailLog, bestNode.Name)
+	}
+	return bestNode
+}
+
+func (p *NodePool) startPSOOptimizer(interval time.Duration) {
+	log.Printf("[PSO-WORKER] Optimizer F-PSO berjalan otomatis HANYA saat ada trafik load test...\n")
+	go func() {
+		ticker := time.NewTicker(interval)
+		for range ticker.C {
+			if len(p.nodes) < 2 {
+				continue
+			}
+
+			// =========================================================
+			// 🛡️ DETEKSI LOAD TEST OTOMATIS BERDASARKAN TRAFIK
+			// =========================================================
+			now := time.Now().UnixNano()
+			lastReq := lastRequestTime.Load()
+
+			// Jika selisih waktu dari request terakhir lebih dari 5 detik,
+			// berarti JMeter sudah dimatikan/idle. Lewati proses belajar!
+			if (now - lastReq) > (5 * time.Second).Nanoseconds() {
+				continue
+			}
+			// =========================================================
+
+			// 1. Ambil data saat ini (hanya tereksekusi saat JMeter aktif)
+			p.nodes[0].mutex.RLock()
+			n1 := *p.nodes[0]
+			p.nodes[0].mutex.RUnlock()
+			p.nodes[1].mutex.RLock()
+			n2 := *p.nodes[1]
+			p.nodes[1].mutex.RUnlock()
+
+			// 2. Jalankan PSO
+			currentParams := AdaptiveFPSOEngine.GetParams()
+			swarm := pso.NewSwarm(currentParams, func(params []float64) float64 {
+				return evaluateFitnessRealtime(params, &n1, &n2)
+			})
+			bestParams := swarm.Optimize()
+
+			// 3. Terapkan & Simpan
+			AdaptiveFPSOEngine.UpdateParams(bestParams)
+			saveParamsToFile("/logs/pso_params.json", bestParams)
+			log.Println("[PSO] Model beradaptasi dari trafik masuk dan disimpan ke /logs/pso_params.json")
+		}
+	}()
 }
 
 // instance reverse proxy
@@ -258,8 +418,12 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 		Transport: customTransport,
 		Director: func(req *http.Request) {
 
+			lastRequestTime.Store(time.Now().UnixNano())
+
 			// backendNode := pool.selectBackend_F_PSO_Framework()
-			backendNode := pool.selectBackend_RoundRobin()
+			// backendNode := pool.selectBackend_RoundRobin()
+			backendNode := pool.selectBackend_Fuzzy_Static() // TAG: :fuzzy
+			// backendNode := pool.selectBackend_FPSO_Adaptive()
 
 			if backendNode == nil {
 				log.Println("Gagal memilih backend, tidak ada node tersedia.")
@@ -311,14 +475,48 @@ func init() {
 }
 
 func main() {
+	// =====================================================================
+	// 1. SETUP LOGGING (Menulis log ke terminal DAN ke folder /logs)
+	// =====================================================================
+	// Membuka atau membuat file hasil_fpso.log di folder /logs
+	logFile, err := os.OpenFile("/logs/hasil_fuzzy.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Printf("Gagal membuka file log di /logs: %v. Log hanya tampil di terminal.", err)
+	} else {
+		defer logFile.Close()
+		multiWriter := io.MultiWriter(os.Stdout, logFile)
+		log.SetOutput(multiWriter)
+	}
 
-	// Inisialisasi daftar Node
+	// =====================================================================
+	// 2. INISIALISASI OTAK FUZZY & F-PSO (Sangat Krusial!)
+	// =====================================================================
+	var BaseFuzzyParams = []float64{
+		// CPU (Rendah, Sedang, Tinggi)
+		0, 0, 50, 0, 50, 100, 50, 100, 100,
+		// Queue (Rendah, Sedang, Tinggi)
+		0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+		// Latency (Cepat, Normal, Lambat)
+		0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+	}
+
+	// Buat Mesin Statis (Pembanding)
+	StaticFuzzyEngine = fuzzy.NewEngine(BaseFuzzyParams)
+
+	// Coba muat parameter yang sudah pintar dari file (jika ada)
+	activePSOParams := loadOptimizedParams("/logs/pso_params.json", BaseFuzzyParams)
+
+	// Buat Mesin Adaptif menggunakan parameter tersebut
+	AdaptiveFPSOEngine = fuzzy.NewEngine(activePSOParams)
+
+	// =====================================================================
+	// 3. INISIALISASI NODE BACKEND
+	// =====================================================================
 	backendDNS := []string{
 		"http://api-node1:8080",
 		"http://api-node2:8080",
 	}
 
-	//  HTTP client untuk metrik Timeout 0.5 detik
 	metricsClient := &http.Client{
 		Timeout: 500 * time.Millisecond,
 	}
@@ -338,27 +536,39 @@ func main() {
 		log.Printf("Mendaftarkan backend node: %s di %s\n", nodeName, backendURL)
 	}
 
-	// kolektor metrik di background (update setiap 500 ms).
-	pool.startMetricsCollector(500 * time.Millisecond)
+	// =====================================================================
+	// 4. MENJALANKAN BACKGROUND WORKER (Metrik & PSO)
+	// =====================================================================
+	pool.startMetricsCollector(200 * time.Millisecond)
 
+	// PSO berjalan setiap 5 detik, belajar, lalu menyimpan ke /logs/pso_params.json
+	pool.startPSOOptimizer(5 * time.Second)
+
+	// =====================================================================
+	// 5. MENJALANKAN SERVER REVERSE PROXY
+	// =====================================================================
 	mux := http.NewServeMux()
+
+	// Daftarkan endpoint metrik untuk Prometheus
 	mux.Handle("/metrics", promhttp.Handler())
 
+	// Buat instance proxy yang di dalamnya sudah ada "Saklar" algoritma
 	proxy := newReverseProxy(pool)
 
-	// metrics handler
+	// Handler utama
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Pengecekan manual agar path /metrics tidak nyasar ke backend
 		if r.URL.Path == "/metrics" {
 			promhttp.Handler().ServeHTTP(w, r)
 			return
 		}
-		// Jalankan proxy untuk trafik lainnya
+		// Jalankan proxy untuk trafik HTTP lainnya (JMeter)
 		proxy.ServeHTTP(w, r)
 	})
 
-	log.Println("Memulai Load Balancer di port :8080...")
+	log.Println("Memulai Load Balancer F-PSO di port :8080...")
 
-	//  konfigurasi server dengan timeout
+	// Konfigurasi server dengan timeout agar tangguh saat diserang JMeter
 	server := &http.Server{
 		Addr:         ":8080",
 		Handler:      mux,
