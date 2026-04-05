@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/load"
@@ -19,13 +20,66 @@ import (
 
 var nodeName string
 var myProcess *process.Process
+var (
+	cachedCPU  float64
+	cpuMutex   sync.RWMutex
+	cpuHistory []float64 // Menyimpan riwayat beberapa metrik terakhir
+)
 
+// Inisialisasi proses Golang ini sebagai target pantauan CCTV (hanya jalan sekali)
 // Inisialisasi proses Golang ini sebagai target pantauan CCTV (hanya jalan sekali)
 func init() {
 	var err error
 	myProcess, err = process.NewProcess(int32(os.Getpid()))
 	if err != nil {
 		log.Printf("[WARNING] Gagal inisialisasi pembaca metrik Container: %v", err)
+	}
+
+	if myProcess != nil {
+		// Pancing inisialisasi awal gopsutil
+		myProcess.Percent(0)
+
+		// Jalankan Background Worker untuk menghitung CPU layaknya Docker Stats (Tiap 1 detik)
+		go startCPUMonitor()
+	}
+}
+
+// Pekerja di background yang merata-ratakan CPU setiap 1 detik
+func startCPUMonitor() {
+	// 1. Bangun setiap 200ms (Sangat Cepat & Responsif)
+	ticker := time.NewTicker(200 * time.Millisecond)
+
+	// 2. Batas history adalah 5 (5 x 200ms = 1000ms / 1 detik)
+	const windowSize = 5
+
+	for range ticker.C {
+		val, err := myProcess.Percent(0) // Membaca beban di 200ms terakhir
+		if err == nil {
+			if val > 100.0 {
+				val = 100.0
+			}
+
+			cpuMutex.Lock()
+
+			// Masukkan data terbaru ke dalam riwayat
+			cpuHistory = append(cpuHistory, val)
+
+			// Jika riwayat lebih dari 5, hapus data yang paling tua (ujung kiri)
+			if len(cpuHistory) > windowSize {
+				cpuHistory = cpuHistory[1:]
+			}
+
+			// Hitung rata-rata dari seluruh riwayat saat ini
+			sum := 0.0
+			for _, v := range cpuHistory {
+				sum += v
+			}
+
+			// Simpan hasil rata-rata ke cache untuk dibaca oleh Load Balancer
+			cachedCPU = sum / float64(len(cpuHistory))
+
+			cpuMutex.Unlock()
+		}
 	}
 }
 
@@ -44,22 +98,16 @@ type NodeMetrics struct {
 }
 
 // HANDLER METRIK
+// HANDLER METRIK
 func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
-	// HOST_PROC sudah dihapus agar tidak bocor ke host OS
-
 	var cpuUsage float64
 	var memUsage float32
 
 	if myProcess != nil {
-		// 1. CPU Usage murni milik container ini
-		cpuVal, err := myProcess.Percent(0)
-		if err == nil {
-			cpuUsage = cpuVal
-			// Batasi maksimal 100% agar logika Fuzzy-PSO di Load Balancer tidak rusak
-			if cpuUsage > 100.0 {
-				cpuUsage = 100.0
-			}
-		}
+		// 1. Ambil nilai CPU dari Cache (Hasil rata-rata 1 detik)
+		cpuMutex.RLock()
+		cpuUsage = cachedCPU
+		cpuMutex.RUnlock()
 
 		// 2. Memory Usage murni milik container ini
 		memVal, err := myProcess.MemoryPercent()
@@ -106,7 +154,7 @@ func dataProcessHandler(w http.ResponseWriter, r *http.Request) {
 
 	// SIMULASI BEBAN CPU: Hashing berulang 50 kali
 	hashResult := ""
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 50000; i++ {
 		hash := sha256.Sum256(body)
 		hashResult = fmt.Sprintf("%x", hash)
 	}
