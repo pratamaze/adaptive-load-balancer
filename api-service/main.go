@@ -52,17 +52,30 @@ func startCPUMonitor() {
 	// 2. Batas history adalah 5 (5 x 200ms = 1000ms / 1 detik)
 	const windowSize = 5
 
+	// --- BACA LIMIT DARI DOCKER ENVIRONMENT ---
+	limitStr := os.Getenv("CPU_LIMIT_PERCENT")
+	cpuLimit, err := strconv.ParseFloat(limitStr, 64)
+	if err != nil || cpuLimit <= 0 {
+		cpuLimit = 100.0 // Default 100% jika tidak di-setting di docker-compose
+	}
+
 	for range ticker.C {
-		val, err := myProcess.Percent(0) // Membaca beban di 200ms terakhir
+		val, err := myProcess.Percent(0) // Membaca beban fisik di 200ms terakhir
 		if err == nil {
-			if val > 100.0 {
-				val = 100.0
+
+			// --- LAKUKAN NORMALISASI DINAMIS ---
+			// Contoh: Fisik terpakai 30%, Limit kontainer 30%. Maka (30/30)*100 = 100%
+			scaledVal := (val / cpuLimit) * 100.0
+
+			// Cegah nilai lebih dari 100% jika ada lonjakan mikro dari Linux
+			if scaledVal > 100.0 {
+				scaledVal = 100.0
 			}
 
 			cpuMutex.Lock()
 
-			// Masukkan data terbaru ke dalam riwayat
-			cpuHistory = append(cpuHistory, val)
+			// Masukkan data *hasil normalisasi* ke dalam riwayat
+			cpuHistory = append(cpuHistory, scaledVal)
 
 			// Jika riwayat lebih dari 5, hapus data yang paling tua (ujung kiri)
 			if len(cpuHistory) > windowSize {
@@ -154,10 +167,12 @@ func dataProcessHandler(w http.ResponseWriter, r *http.Request) {
 
 	// SIMULASI BEBAN CPU: Hashing berulang 50 kali
 	hashResult := ""
-	for i := 0; i < 50000; i++ {
-		hash := sha256.Sum256(body)
-		hashResult = fmt.Sprintf("%x", hash)
+	var hash [32]byte
+	for i := 0; i < 6000; i++ {
+		hash = sha256.Sum256(body)
+
 	}
+	hashResult = fmt.Sprintf("%x", hash)
 
 	duration := time.Since(startTime)
 	w.WriteHeader(http.StatusOK)
