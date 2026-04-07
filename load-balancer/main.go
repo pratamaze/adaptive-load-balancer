@@ -422,8 +422,8 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 
 			// backendNode := pool.selectBackend_F_PSO_Framework()
 			// backendNode := pool.selectBackend_RoundRobin()
-			backendNode := pool.selectBackend_Fuzzy_Static() // TAG: :fuzzy
-			// backendNode := pool.selectBackend_FPSO_Adaptive()
+			// backendNode := pool.selectBackend_Fuzzy_Static() // TAG: :fuzzy
+			backendNode := pool.selectBackend_FPSO_Adaptive()
 
 			if backendNode == nil {
 				log.Println("Gagal memilih backend, tidak ada node tersedia.")
@@ -479,7 +479,7 @@ func main() {
 	// 1. SETUP LOGGING (Menulis log ke terminal DAN ke folder /logs)
 	// =====================================================================
 	// Membuka atau membuat file hasil_fpso.log di folder /logs
-	logFile, err := os.OpenFile("/logs/hasil_fuzzy.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	logFile, err := os.OpenFile("/logs/hasil_fpso.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Printf("Gagal membuka file log di /logs: %v. Log hanya tampil di terminal.", err)
 	} else {
