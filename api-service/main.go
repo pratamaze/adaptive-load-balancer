@@ -11,14 +11,85 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/load"
-	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/shirou/gopsutil/v3/process" // Package metrik spesifik container
 )
 
 var nodeName string
+var myProcess *process.Process
+var (
+	cachedCPU  float64
+	cpuMutex   sync.RWMutex
+	cpuHistory []float64 // Menyimpan riwayat beberapa metrik terakhir
+)
+
+func init() {
+	var err error
+	myProcess, err = process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		log.Printf("[WARNING] Gagal inisialisasi pembaca metrik Container: %v", err)
+	}
+
+	if myProcess != nil {
+		// inisialisasi awal gopsutil
+		myProcess.Percent(0)
+
+		//  Background Worker untuk menghitung CPU layaknya Docker Stats (Tiap 1 detik)
+		go startCPUMonitor()
+	}
+}
+
+// Pekerja di background yang merata-ratakan CPU setiap 1 detik
+func startCPUMonitor() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+
+	// Batas history adalah 5 (5 x 200ms = 1000ms / 1 detik)
+	const windowSize = 5
+
+	limitStr := os.Getenv("CPU_LIMIT_PERCENT")
+	cpuLimit, err := strconv.ParseFloat(limitStr, 64)
+	if err != nil || cpuLimit <= 0 {
+		cpuLimit = 100.0
+	}
+
+	for range ticker.C {
+		val, err := myProcess.Percent(0)
+		if err == nil {
+
+			// NORMALISASI DINAMIS
+			scaledVal := (val / cpuLimit) * 100.0
+
+			// Cegah nilai lebih dari 100% jika ada lonjakan mikro dari Linux
+			if scaledVal > 100.0 {
+				scaledVal = 100.0
+			}
+
+			cpuMutex.Lock()
+
+			// Masukkan data *hasil normalisasi* ke dalam riwayat
+			cpuHistory = append(cpuHistory, scaledVal)
+
+			// Jika riwayat lebih dari 5, hapus data yang paling tua (ujung kiri)
+			if len(cpuHistory) > windowSize {
+				cpuHistory = cpuHistory[1:]
+			}
+
+			// Hitung rata-rata dari seluruh riwayat saat ini
+			sum := 0.0
+			for _, v := range cpuHistory {
+				sum += v
+			}
+
+			// Simpan hasil rata-rata ke cache untuk dibaca oleh Load Balancer
+			cachedCPU = sum / float64(len(cpuHistory))
+
+			cpuMutex.Unlock()
+		}
+	}
+}
 
 type ResponseData struct {
 	Message   string `json:"message"`
@@ -36,39 +107,32 @@ type NodeMetrics struct {
 
 // HANDLER METRIK
 func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
+	var cpuUsage float64
+	var memUsage float32
 
-	os.Setenv("HOST_PROC", "/host/proc")
+	if myProcess != nil {
+		cpuMutex.RLock()
+		cpuUsage = cachedCPU
+		cpuMutex.RUnlock()
 
-	//  CPU Usage (non-blocking)
-	cpuPercent, err := cpu.Percent(0, false)
-	if err != nil {
-		log.Printf("Error getting cpu: %v", err)
-		http.Error(w, "Failed to get CPU", http.StatusInternalServerError)
-		return
+		memVal, err := myProcess.MemoryPercent()
+		if err == nil {
+			memUsage = memVal
+		}
 	}
 
-	//  Memory Usage
-	vm, err := mem.VirtualMemory()
-	if err != nil {
-		log.Printf("Error getting mem: %v", err)
-		http.Error(w, "Failed to get Memory", http.StatusInternalServerError)
-		return
-	}
-
-	//  Load Average
+	loadAvg1 := 0.0
 	loadAvg, err := load.Avg()
-	if err != nil {
-		log.Printf("Error getting load: %v", err)
-		http.Error(w, "Failed to get Load", http.StatusInternalServerError)
-		return
+	if err == nil {
+		loadAvg1 = loadAvg.Load1
 	}
 
 	// respons metrik
 	metrics := NodeMetrics{
 		NodeName:     name,
-		CPUUsage:     cpuPercent[0],
-		MemoryUsage:  vm.UsedPercent,
-		LoadAverage1: loadAvg.Load1,
+		CPUUsage:     cpuUsage,
+		MemoryUsage:  float64(memUsage),
+		LoadAverage1: loadAvg1,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -94,10 +158,12 @@ func dataProcessHandler(w http.ResponseWriter, r *http.Request) {
 
 	// SIMULASI BEBAN CPU: Hashing berulang 50 kali
 	hashResult := ""
-	for i := 0; i < 50; i++ {
-		hash := sha256.Sum256(body)
-		hashResult = fmt.Sprintf("%x", hash)
+	var hash [32]byte
+	for i := 0; i < 6000; i++ {
+		hash = sha256.Sum256(body)
+
 	}
+	hashResult = fmt.Sprintf("%x", hash)
 
 	duration := time.Since(startTime)
 	w.WriteHeader(http.StatusOK)
@@ -119,7 +185,7 @@ func dataFetchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if sizeKB > 500 {
-		sizeKB = 500 // Maksimal 500 KB agar bandwidth aman
+		sizeKB = 500
 	}
 
 	// SIMULASI BEBAN CPU: Membangun string besar
@@ -139,7 +205,6 @@ func dataFetchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-
 	nName := flag.String("name", "API-NODE-UNKNOWN", "Nama unik untuk instance API node ini")
 	flag.Parse()
 	nodeName = *nName
