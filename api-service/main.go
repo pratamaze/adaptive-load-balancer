@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/shirou/gopsutil/v3/load"
-	"github.com/shirou/gopsutil/v3/process" // Package baru untuk metrik spesifik container
+	"github.com/shirou/gopsutil/v3/process" // Package metrik spesifik container
 )
 
 var nodeName string
@@ -26,8 +26,6 @@ var (
 	cpuHistory []float64 // Menyimpan riwayat beberapa metrik terakhir
 )
 
-// Inisialisasi proses Golang ini sebagai target pantauan CCTV (hanya jalan sekali)
-// Inisialisasi proses Golang ini sebagai target pantauan CCTV (hanya jalan sekali)
 func init() {
 	var err error
 	myProcess, err = process.NewProcess(int32(os.Getpid()))
@@ -36,35 +34,32 @@ func init() {
 	}
 
 	if myProcess != nil {
-		// Pancing inisialisasi awal gopsutil
+		// inisialisasi awal gopsutil
 		myProcess.Percent(0)
 
-		// Jalankan Background Worker untuk menghitung CPU layaknya Docker Stats (Tiap 1 detik)
+		//  Background Worker untuk menghitung CPU layaknya Docker Stats (Tiap 1 detik)
 		go startCPUMonitor()
 	}
 }
 
 // Pekerja di background yang merata-ratakan CPU setiap 1 detik
 func startCPUMonitor() {
-	// 1. Bangun setiap 200ms (Sangat Cepat & Responsif)
 	ticker := time.NewTicker(200 * time.Millisecond)
 
-	// 2. Batas history adalah 5 (5 x 200ms = 1000ms / 1 detik)
+	// Batas history adalah 5 (5 x 200ms = 1000ms / 1 detik)
 	const windowSize = 5
 
-	// --- BACA LIMIT DARI DOCKER ENVIRONMENT ---
 	limitStr := os.Getenv("CPU_LIMIT_PERCENT")
 	cpuLimit, err := strconv.ParseFloat(limitStr, 64)
 	if err != nil || cpuLimit <= 0 {
-		cpuLimit = 100.0 // Default 100% jika tidak di-setting di docker-compose
+		cpuLimit = 100.0
 	}
 
 	for range ticker.C {
-		val, err := myProcess.Percent(0) // Membaca beban fisik di 200ms terakhir
+		val, err := myProcess.Percent(0)
 		if err == nil {
 
-			// --- LAKUKAN NORMALISASI DINAMIS ---
-			// Contoh: Fisik terpakai 30%, Limit kontainer 30%. Maka (30/30)*100 = 100%
+			// NORMALISASI DINAMIS
 			scaledVal := (val / cpuLimit) * 100.0
 
 			// Cegah nilai lebih dari 100% jika ada lonjakan mikro dari Linux
@@ -111,25 +106,21 @@ type NodeMetrics struct {
 }
 
 // HANDLER METRIK
-// HANDLER METRIK
 func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
 	var cpuUsage float64
 	var memUsage float32
 
 	if myProcess != nil {
-		// 1. Ambil nilai CPU dari Cache (Hasil rata-rata 1 detik)
 		cpuMutex.RLock()
 		cpuUsage = cachedCPU
 		cpuMutex.RUnlock()
 
-		// 2. Memory Usage murni milik container ini
 		memVal, err := myProcess.MemoryPercent()
 		if err == nil {
 			memUsage = memVal
 		}
 	}
 
-	// 3. Load Average
 	loadAvg1 := 0.0
 	loadAvg, err := load.Avg()
 	if err == nil {
@@ -194,7 +185,7 @@ func dataFetchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if sizeKB > 500 {
-		sizeKB = 500 // Maksimal 500 KB agar bandwidth aman
+		sizeKB = 500
 	}
 
 	// SIMULASI BEBAN CPU: Membangun string besar
