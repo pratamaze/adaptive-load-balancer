@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,9 +26,12 @@ var nodeName string
 var hostName string
 var myProcess *process.Process
 var (
-	cachedCPU  float64
-	cpuMutex   sync.RWMutex
-	cpuHistory []float64
+	cachedCPU          float64
+	cpuMutex           sync.RWMutex
+	cpuHistory         []float64
+	cpuLimitPercent    = 100.0
+	inflightRequests   atomic.Int64
+	requestLatencyEWMA atomic.Uint64
 )
 
 var (
@@ -65,24 +69,28 @@ func init() {
 
 	if myProcess != nil {
 		myProcess.Percent(0)
+		cpuLimitPercent = parseCPULimitPercent()
 		go startCPUMonitor()
 	}
+}
+
+func parseCPULimitPercent() float64 {
+	limitStr := os.Getenv("CPU_LIMIT_PERCENT")
+	cpuLimit, err := strconv.ParseFloat(limitStr, 64)
+	if err != nil || cpuLimit <= 0 {
+		return 100.0
+	}
+	return cpuLimit
 }
 
 func startCPUMonitor() {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	const windowSize = 5
 
-	limitStr := os.Getenv("CPU_LIMIT_PERCENT")
-	cpuLimit, err := strconv.ParseFloat(limitStr, 64)
-	if err != nil || cpuLimit <= 0 {
-		cpuLimit = 100.0
-	}
-
 	for range ticker.C {
 		val, err := myProcess.Percent(0)
 		if err == nil {
-			scaledVal := (val / cpuLimit) * 100.0
+			scaledVal := (val / cpuLimitPercent) * 100.0
 			if scaledVal > 100.0 {
 				scaledVal = 100.0
 			}
@@ -110,10 +118,33 @@ type ResponseData struct {
 }
 
 type NodeMetrics struct {
-	NodeName     string  `json:"node_name"`
-	CPUUsage     float64 `json:"cpu_usage"`
-	MemoryUsage  float64 `json:"memory_usage"`
-	LoadAverage1 float64 `json:"load_average_1"`
+	NodeName         string  `json:"node_name"`
+	CPUUsage         float64 `json:"cpu_usage"`
+	MemoryUsage      float64 `json:"memory_usage"`
+	LoadAverage1     float64 `json:"load_average_1"`
+	RequestLatencyMS float64 `json:"request_latency_ms"`
+	InflightRequests float64 `json:"inflight_requests"`
+	CPUCapacity      float64 `json:"cpu_capacity_percent"`
+}
+
+func loadRequestLatencyEWMA() float64 {
+	return math.Float64frombits(requestLatencyEWMA.Load())
+}
+
+func updateRequestLatencyEWMA(sampleMS float64) {
+	const alpha = 0.25
+	for {
+		currentBits := requestLatencyEWMA.Load()
+		current := math.Float64frombits(currentBits)
+		next := sampleMS
+		if current > 0 {
+			next = alpha*sampleMS + (1-alpha)*current
+		}
+		nextBits := math.Float64bits(next)
+		if requestLatencyEWMA.CompareAndSwap(currentBits, nextBits) {
+			return
+		}
+	}
 }
 
 func metricsJSONHandler(w http.ResponseWriter, r *http.Request, name string) {
@@ -138,10 +169,13 @@ func metricsJSONHandler(w http.ResponseWriter, r *http.Request, name string) {
 	}
 
 	metrics := NodeMetrics{
-		NodeName:     name,
-		CPUUsage:     cpuUsage,
-		MemoryUsage:  float64(memUsage),
-		LoadAverage1: loadAvg1,
+		NodeName:         name,
+		CPUUsage:         cpuUsage,
+		MemoryUsage:      float64(memUsage),
+		LoadAverage1:     loadAvg1,
+		RequestLatencyMS: loadRequestLatencyEWMA(),
+		InflightRequests: float64(inflightRequests.Load()),
+		CPUCapacity:      cpuLimitPercent,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -298,14 +332,24 @@ func withBackendHeader(next http.Handler) http.Handler {
 
 func withPrometheus(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inflightRequests.Add(1)
+		defer inflightRequests.Add(-1)
+
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
+		durationSeconds := time.Since(start).Seconds()
+		durationMS := durationSeconds * 1000.0
 
 		statusStr := strconv.Itoa(rec.status)
 		labels := []string{hostName, nodeName, r.Method, r.URL.Path, statusStr}
 		apiRequestTotal.WithLabelValues(labels...).Inc()
-		apiRequestDuration.WithLabelValues(labels...).Observe(time.Since(start).Seconds())
+		apiRequestDuration.WithLabelValues(labels...).Observe(durationSeconds)
+
+		// Endpoint metrik tidak dipakai sebagai sinyal latency bisnis.
+		if r.URL.Path != "/metrics" && r.URL.Path != "/metrics/prometheus" {
+			updateRequestLatencyEWMA(durationMS)
+		}
 	})
 }
 

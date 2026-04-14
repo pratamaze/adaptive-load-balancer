@@ -61,6 +61,8 @@ func NewSwarm(initialFLParams []float64, fitnessFunc func([]float64) float64) *S
 
 			p.PBest[d] = p.X[d]
 		}
+		repairParams(p.X)
+		copy(p.PBest, p.X)
 		s.Particles[i] = p
 	}
 
@@ -105,15 +107,84 @@ func (s *Swarm) Optimize() []float64 {
 
 				// 10: xi(t+1) = xi(t) + vi(t+1)
 				p.X[d] = p.X[d] + p.V[d]
-
-				// Optional Clamping: Mencegah nilai parameter FL menjadi negatif absolut (sesuaikan jika batas minimal FL bukan 0)
-				if p.X[d] < 0.0 {
-					p.X[d] = 0.0
-				}
 			}
+			repairParams(p.X)
 		}
 	}
 
 	// 13: return gbest
 	return s.GBest
+}
+
+func upperBound(d int) float64 {
+	switch {
+	case d <= 8:
+		return 100
+	case d <= 17:
+		return 2000
+	default:
+		return 2000
+	}
+}
+
+func clamp(v, lo, hi float64) float64 {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func repairParams(params []float64) {
+	const eps = 1e-6
+	for i := 0; i+2 < len(params); i += 3 {
+		lo := 0.0
+		hi := upperBound(i)
+		a := clamp(params[i], lo, hi)
+		b := clamp(params[i+1], lo, hi)
+		c := clamp(params[i+2], lo, hi)
+
+		if a > b {
+			a, b = b, a
+		}
+		if b > c {
+			b, c = c, b
+		}
+		if a > b {
+			a, b = b, a
+		}
+		if b < a+eps {
+			b = a + eps
+		}
+		if c < b+eps {
+			c = b + eps
+		}
+		if c > hi {
+			c = hi
+			if b > c-eps {
+				b = c - eps
+			}
+			if b < a+eps {
+				a = b - eps
+			}
+		}
+		if a < lo {
+			a = lo
+		}
+		if b < a+eps {
+			b = a + eps
+		}
+		if c < b+eps {
+			c = b + eps
+		}
+		if c > hi {
+			c = hi
+		}
+
+		params[i] = a
+		params[i+1] = b
+		params[i+2] = c
+	}
 }

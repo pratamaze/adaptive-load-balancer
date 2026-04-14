@@ -21,6 +21,7 @@ const (
 // NodeState menyimpan data historis + metrik observasi saat replay.
 type NodeState struct {
 	CPUUsage     float64
+	CPUCapacity  float64
 	QueueLength  float64
 	ResponseTime float64
 	Requests     int64
@@ -74,6 +75,7 @@ type evaluator struct {
 	snap       HistoricalSnapshot
 	totalReq   int64
 	costPerReq [2]float64
+	capacity   [2]float64
 }
 
 func newEvaluator(snap HistoricalSnapshot) evaluator {
@@ -87,10 +89,19 @@ func newEvaluator(snap HistoricalSnapshot) evaluator {
 	if c2 < 0 {
 		c2 = 0
 	}
+	cap1 := snap.Node1.CPUCapacity
+	if cap1 <= 0 {
+		cap1 = 100
+	}
+	cap2 := snap.Node2.CPUCapacity
+	if cap2 <= 0 {
+		cap2 = 100
+	}
 	return evaluator{
 		snap:       snap,
 		totalReq:   snap.Node1.Requests + snap.Node2.Requests,
 		costPerReq: [2]float64{c1, c2},
+		capacity:   [2]float64{cap1, cap2},
 	}
 }
 
@@ -121,20 +132,23 @@ func (e evaluator) evaluate(params []float64) (Objective, float64, float64) {
 		sim2 = 0
 	}
 
-	// DI dipaksa jadi objective utama.
-	sumCPU := sim1 + sim2
+	// Objective disejajarkan ke kapasitas node heterogen.
+	util1 := sim1 / maxFloat(e.capacity[0], 1e-9)
+	util2 := sim2 / maxFloat(e.capacity[1], 1e-9)
+	sumCPU := util1 + util2
 	if sumCPU < 1e-9 {
 		sumCPU = 1e-9
 	}
-	di := math.Abs(sim1-sim2) / sumCPU
-	hi := math.Max(sim1, sim2)
-	lo := math.Min(sim1, sim2)
+	di := math.Abs(util1-util2) / sumCPU
+	hi := math.Max(util1, util2)
+	lo := math.Min(util1, util2)
 	bcu := lo / maxFloat(hi, 1e-9)
-	diPenalty := (2.8 * di * di) + (1.4 * (1.0-bcu) * (1.0-bcu))
-	peakPenalty := hi + 12.0*di
+	diPenalty := (2.8 * di * di) + (1.4 * (1.0 - bcu) * (1.0 - bcu))
+	latTail := math.Max(e.snap.Node1.ResponseTime, e.snap.Node2.ResponseTime) / 1000.0
+	peakPenalty := hi + 0.30*latTail
 
 	// f1 = penalti keseimbangan berbasis DI+BCU.
-	// f2 = penalti puncak beban (tetap memitigasi latensi tail).
+	// f2 = penalti puncak utilitas node + latensi tail.
 	obj := Objective{
 		Imbalance: diPenalty,
 		PeakLoad:  peakPenalty,
@@ -169,6 +183,8 @@ func OptimizeReplay(baseParams []float64, snap HistoricalSnapshot) ParetoResult 
 			v[d] = rng.Float64()*2 - 1
 			pb[d] = x[d]
 		}
+		repairParams(x)
+		copy(pb, x)
 		particles[i] = particle{x: x, v: v, pbest: pb}
 	}
 
@@ -207,6 +223,7 @@ func OptimizeReplay(baseParams []float64, snap HistoricalSnapshot) ParetoResult 
 				p.v[d] = v
 				p.x[d] = clamp(x, lowerBound(d), upperBound(d))
 			}
+			repairParams(p.x)
 		}
 	}
 
@@ -399,6 +416,60 @@ func clone27(src []float64) []float64 {
 func almostEqual(a, b float64) bool {
 	const eps = 1e-9
 	return math.Abs(a-b) <= eps
+}
+
+func repairParams(params []float64) {
+	const eps = 1e-6
+	for i := 0; i+2 < len(params); i += 3 {
+		a := clamp(params[i], lowerBound(i), upperBound(i))
+		b := clamp(params[i+1], lowerBound(i+1), upperBound(i+1))
+		c := clamp(params[i+2], lowerBound(i+2), upperBound(i+2))
+
+		if a > b {
+			a, b = b, a
+		}
+		if b > c {
+			b, c = c, b
+		}
+		if a > b {
+			a, b = b, a
+		}
+
+		if b < a+eps {
+			b = a + eps
+		}
+		if c < b+eps {
+			c = b + eps
+		}
+
+		hi := upperBound(i)
+		if c > hi {
+			c = hi
+			if b > c-eps {
+				b = c - eps
+			}
+			if b < a+eps {
+				a = b - eps
+			}
+		}
+		lo := lowerBound(i)
+		if a < lo {
+			a = lo
+		}
+		if b < a+eps {
+			b = a + eps
+		}
+		if c < b+eps {
+			c = b + eps
+		}
+		if c > hi {
+			c = hi
+		}
+
+		params[i] = a
+		params[i+1] = b
+		params[i+2] = c
+	}
 }
 
 // ---- Fast fuzzy scoring (allocation-free path) ----

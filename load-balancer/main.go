@@ -30,6 +30,7 @@ var lastRequestTime atomic.Int64
 const (
 	baseFuzzyParamsPath = "configs/base_fuzzy_params.json"
 	psoParamsPath       = "storage/pso_params.json"
+	fmopsoParamsPath    = "storage/fmopso_params.json"
 	paretoFrontPath     = "storage/pareto_front.json"
 	mainLogPath         = "logs/hasil_fpso.log"
 	mopsoLogPath        = "logs/mopso_historical.log"
@@ -38,10 +39,13 @@ const (
 
 // Harus sama dengan yang ada di api-service.
 type NodeMetrics struct {
-	NodeName     string  `json:"node_name"`
-	CPUUsage     float64 `json:"cpu_usage"`
-	MemoryUsage  float64 `json:"memory_usage"`
-	LoadAverage1 float64 `json:"load_average_1"`
+	NodeName         string  `json:"node_name"`
+	CPUUsage         float64 `json:"cpu_usage"`
+	MemoryUsage      float64 `json:"memory_usage"`
+	LoadAverage1     float64 `json:"load_average_1"`
+	RequestLatencyMS float64 `json:"request_latency_ms"`
+	InflightRequests float64 `json:"inflight_requests"`
+	CPUCapacity      float64 `json:"cpu_capacity_percent"`
 }
 
 // backend service.
@@ -51,8 +55,10 @@ type Node struct {
 
 	CPUUsage     float64
 	LoadAverage  float64
+	InflightReq  float64
 	MemoryUsage  float64
 	ResponseTime float64
+	CPUCapacity  float64
 
 	RequestCount atomic.Int64
 	mutex        sync.RWMutex
@@ -159,10 +165,67 @@ func saveJSONToFile(filename string, payload any) error {
 	return enc.Encode(payload)
 }
 
+func nodeQueueSignal(n *Node) float64 {
+	// Gabungkan in-flight request dengan load average host untuk sinyal queue yang lebih responsif.
+	inflightSignal := n.InflightReq * 30.0
+	loadSignal := n.LoadAverage * 10.0
+	if inflightSignal > loadSignal {
+		return inflightSignal
+	}
+	return loadSignal
+}
+
+func sanitizeFuzzyParams(params []float64) []float64 {
+	out := append([]float64(nil), params...)
+	const eps = 1e-6
+	for i := 0; i+2 < len(out); i += 3 {
+		hi := 2000.0
+		if i <= 6 {
+			hi = 100
+		}
+		a := math.Max(0, math.Min(hi, out[i]))
+		b := math.Max(0, math.Min(hi, out[i+1]))
+		c := math.Max(0, math.Min(hi, out[i+2]))
+
+		if a > b {
+			a, b = b, a
+		}
+		if b > c {
+			b, c = c, b
+		}
+		if a > b {
+			a, b = b, a
+		}
+		if b < a+eps {
+			b = a + eps
+		}
+		if c < b+eps {
+			c = b + eps
+		}
+		if c > hi {
+			c = hi
+			if b > c-eps {
+				b = c - eps
+			}
+			if b < a+eps {
+				a = math.Max(0, b-eps)
+			}
+		}
+
+		out[i] = a
+		out[i+1] = b
+		out[i+2] = c
+	}
+	return out
+}
+
 func evaluateFitnessRealtime(params []float64, n1, n2 *Node) float64 {
-	dummyEngine := fuzzy.NewEngine(params)
-	score1 := dummyEngine.CalculateMamdani(fuzzy.NodeMetrics{CPU: n1.CPUUsage, QueueLength: n1.LoadAverage * 10, RespTime: n1.ResponseTime}, myRules)
-	score2 := dummyEngine.CalculateMamdani(fuzzy.NodeMetrics{CPU: n2.CPUUsage, QueueLength: n2.LoadAverage * 10, RespTime: n2.ResponseTime}, myRules)
+	safeParams := sanitizeFuzzyParams(params)
+	dummyEngine := fuzzy.NewEngine(safeParams)
+	q1 := nodeQueueSignal(n1)
+	q2 := nodeQueueSignal(n2)
+	score1 := dummyEngine.CalculateMamdani(fuzzy.NodeMetrics{CPU: n1.CPUUsage, QueueLength: q1, RespTime: n1.ResponseTime}, myRules)
+	score2 := dummyEngine.CalculateMamdani(fuzzy.NodeMetrics{CPU: n2.CPUUsage, QueueLength: q2, RespTime: n2.ResponseTime}, myRules)
 
 	totalScore := score1 + score2
 	share1 := 0.5
@@ -176,16 +239,18 @@ func evaluateFitnessRealtime(params []float64, n1, n2 *Node) float64 {
 		}
 	}
 
-	totalCPU := n1.CPUUsage + n2.CPUUsage
-	if totalCPU < 1 {
-		totalCPU = 1
+	cap1 := math.Max(n1.CPUCapacity, 1)
+	cap2 := math.Max(n2.CPUCapacity, 1)
+	totalNormCPU := (n1.CPUUsage / cap1) + (n2.CPUUsage / cap2)
+	if totalNormCPU < 1e-6 {
+		totalNormCPU = 1e-6
 	}
-	sim1 := totalCPU * share1
-	sim2 := totalCPU - sim1
+	util1 := totalNormCPU * share1
+	util2 := totalNormCPU - util1
 
-	di := math.Abs(sim1-sim2) / math.Max(sim1+sim2, 1e-9)
-	bcu := math.Min(sim1, sim2) / math.Max(math.Max(sim1, sim2), 1e-9)
-	peak := math.Max(sim1, sim2) / 100.0
+	di := math.Abs(util1-util2) / math.Max(util1+util2, 1e-9)
+	bcu := math.Min(util1, util2) / math.Max(math.Max(util1, util2), 1e-9)
+	peak := math.Max(util1, util2)
 	latPenalty := math.Max(n1.ResponseTime, n2.ResponseTime) / 1000.0
 
 	// Penalti imbalance dibuat non-linear agar PSO sangat alergi ke distribusi berat sebelah.
@@ -194,7 +259,7 @@ func evaluateFitnessRealtime(params []float64, n1, n2 *Node) float64 {
 
 	// Align reward: node dengan CPU lebih tinggi seharusnya mendapat skor fuzzy lebih rendah.
 	align := 0.0
-	if (n1.CPUUsage-n2.CPUUsage)*(score1-score2) < 0 {
+	if (n1.CPUUsage/cap1-n2.CPUUsage/cap2)*(score1-score2) < 0 {
 		align = 0.35
 	}
 
@@ -234,13 +299,23 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 
 	node.CPUUsage = metrics.CPUUsage
 	node.LoadAverage = metrics.LoadAverage1
+	node.InflightReq = metrics.InflightRequests
 	node.MemoryUsage = metrics.MemoryUsage
-	node.ResponseTime = responseTime
+	if metrics.RequestLatencyMS > 0 {
+		node.ResponseTime = metrics.RequestLatencyMS
+	} else {
+		node.ResponseTime = responseTime
+	}
+	if metrics.CPUCapacity > 0 {
+		node.CPUCapacity = metrics.CPUCapacity
+	} else {
+		node.CPUCapacity = 100
+	}
 
 	cpuGauge.WithLabelValues(node.Name).Set(metrics.CPUUsage)
-	latencyGauge.WithLabelValues(node.Name).Set(responseTime)
+	latencyGauge.WithLabelValues(node.Name).Set(node.ResponseTime)
 
-	log.Printf("[METRIC] Node %s: CPU=%.2f%%, Load=%.2f, Latency=%.2fms\n", node.Name, node.CPUUsage, node.LoadAverage, node.ResponseTime)
+	log.Printf("[METRIC] Node %s: CPU=%.2f%%/%.0f%%, Load=%.2f, Inflight=%.2f, Latency=%.2fms\n", node.Name, node.CPUUsage, node.CPUCapacity, node.LoadAverage, node.InflightReq, node.ResponseTime)
 }
 
 func (p *NodePool) updateAllMetrics() {
@@ -283,7 +358,7 @@ func (p *NodePool) selectBackend_RoundRobin() *Node {
 	for _, node := range p.nodes {
 		node.mutex.RLock()
 		cpu := node.CPUUsage
-		queue := node.LoadAverage * 10
+		queue := nodeQueueSignal(node)
 		lat := node.ResponseTime
 		node.mutex.RUnlock()
 		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=0.0000] ", node.Name, cpu, queue, lat)
@@ -299,7 +374,7 @@ func (p *NodePool) selectBackend_Fuzzy_Static() *Node {
 
 	for _, node := range p.nodes {
 		node.mutex.RLock()
-		metrics := fuzzy.NodeMetrics{CPU: node.CPUUsage, QueueLength: node.LoadAverage * 10, RespTime: node.ResponseTime}
+		metrics := fuzzy.NodeMetrics{CPU: node.CPUUsage, QueueLength: nodeQueueSignal(node), RespTime: node.ResponseTime}
 		node.mutex.RUnlock()
 
 		score := StaticFuzzyEngine.CalculateMamdani(metrics, myRules)
@@ -330,7 +405,7 @@ func (p *NodePool) selectBackend_FPSO_Adaptive() *Node {
 
 	for _, node := range p.nodes {
 		node.mutex.RLock()
-		metrics := fuzzy.NodeMetrics{CPU: node.CPUUsage, QueueLength: node.LoadAverage * 10, RespTime: node.ResponseTime}
+		metrics := fuzzy.NodeMetrics{CPU: node.CPUUsage, QueueLength: nodeQueueSignal(node), RespTime: node.ResponseTime}
 		node.mutex.RUnlock()
 
 		score := AdaptiveFPSOEngine.CalculateMamdani(metrics, myRules)
@@ -361,7 +436,7 @@ func (p *NodePool) selectBackend_FMOPSO_Adaptive() *Node {
 
 	for _, node := range p.nodes {
 		node.mutex.RLock()
-		metrics := fuzzy.NodeMetrics{CPU: node.CPUUsage, QueueLength: node.LoadAverage * 10, RespTime: node.ResponseTime}
+		metrics := fuzzy.NodeMetrics{CPU: node.CPUUsage, QueueLength: nodeQueueSignal(node), RespTime: node.ResponseTime}
 		node.mutex.RUnlock()
 
 		score := AdaptiveFMOPSOEngine.CalculateMamdani(metrics, myRules)
@@ -394,11 +469,16 @@ func (p *NodePool) selectBackend() *Node {
 	case "fmopso":
 		return p.selectBackend_FMOPSO_Adaptive()
 	default:
-		return p.selectBackend_FPSO_Adaptive()
+		log.Printf("[WARNING] ALGO tidak dikenal: %s. Fallback ke FUZZY.", p.algorithm)
+		return p.selectBackend_Fuzzy_Static()
 	}
 }
 
 func (p *NodePool) startPSOOptimizer(interval time.Duration) {
+	if p.algorithm != "fpso" {
+		log.Printf("[PSO-WORKER] Dilewati karena ALGO=%s (hanya aktif pada fpso)", p.algorithm)
+		return
+	}
 	log.Printf("[PSO-WORKER] Optimizer F-PSO berjalan otomatis saat ada trafik...\n")
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -408,7 +488,7 @@ func (p *NodePool) startPSOOptimizer(interval time.Duration) {
 			}
 			now := time.Now().UnixNano()
 			lastReq := lastRequestTime.Load()
-			if (now - lastReq) > (5 * time.Second).Nanoseconds() {
+			if (now - lastReq) > (3 * interval).Nanoseconds() {
 				continue
 			}
 
@@ -423,7 +503,7 @@ func (p *NodePool) startPSOOptimizer(interval time.Duration) {
 			swarm := pso.NewSwarm(currentParams, func(params []float64) float64 {
 				return evaluateFitnessRealtime(params, &n1, &n2)
 			})
-			bestParams := swarm.Optimize()
+			bestParams := sanitizeFuzzyParams(swarm.Optimize())
 
 			AdaptiveFPSOEngine.UpdateParams(bestParams)
 			if err := saveJSONToFile(psoParamsPath, bestParams); err != nil {
@@ -436,16 +516,32 @@ func (p *NodePool) startPSOOptimizer(interval time.Duration) {
 }
 
 func (p *NodePool) startMOPSOOptimizer(interval time.Duration) {
+	if p.algorithm != "fmopso" {
+		log.Printf("[MOPSO-WORKER] Dilewati karena ALGO=%s (hanya aktif pada fmopso)", p.algorithm)
+		return
+	}
 	log.Printf("[MOPSO-WORKER] Optimizer F-MOPSO historical replay berjalan setiap %s\n", interval)
 	go func() {
 		ticker := time.NewTicker(interval)
+		var prevReq1 int64
+		var prevReq2 int64
 		for range ticker.C {
 			if len(p.nodes) < 2 {
 				continue
 			}
 
-			r1 := p.nodes[0].RequestCount.Swap(0)
-			r2 := p.nodes[1].RequestCount.Swap(0)
+			curReq1 := p.nodes[0].RequestCount.Load()
+			curReq2 := p.nodes[1].RequestCount.Load()
+			r1 := curReq1 - prevReq1
+			r2 := curReq2 - prevReq2
+			if r1 < 0 {
+				r1 = 0
+			}
+			if r2 < 0 {
+				r2 = 0
+			}
+			prevReq1 = curReq1
+			prevReq2 = curReq2
 			totalReq := r1 + r2
 			if totalReq == 0 {
 				p.logMOPSO("[FACT] Total Request=0, replay dilewati untuk hemat CPU")
@@ -463,13 +559,15 @@ func (p *NodePool) startMOPSOOptimizer(interval time.Duration) {
 				OSIdleCPU10: osIdleCPU10,
 				Node1: mopso.NodeState{
 					CPUUsage:     n1.CPUUsage,
-					QueueLength:  n1.LoadAverage * 10,
+					CPUCapacity:  n1.CPUCapacity,
+					QueueLength:  nodeQueueSignal(&n1),
 					ResponseTime: n1.ResponseTime,
 					Requests:     r1,
 				},
 				Node2: mopso.NodeState{
 					CPUUsage:     n2.CPUUsage,
-					QueueLength:  n2.LoadAverage * 10,
+					CPUCapacity:  n2.CPUCapacity,
+					QueueLength:  nodeQueueSignal(&n2),
 					ResponseTime: n2.ResponseTime,
 					Requests:     r2,
 				},
@@ -487,7 +585,11 @@ func (p *NodePool) startMOPSOOptimizer(interval time.Duration) {
 				p.logMOPSO("[MOPSO] Tidak ada solusi aktif")
 				continue
 			}
-			AdaptiveFMOPSOEngine.UpdateParams(active.Solution.Params)
+			activeParams := sanitizeFuzzyParams(active.Solution.Params)
+			AdaptiveFMOPSOEngine.UpdateParams(activeParams)
+			if err := saveJSONToFile(fmopsoParamsPath, activeParams); err != nil {
+				p.logMOPSO("[MOPSO] Gagal menyimpan parameter aktif ke %s: %v", fmopsoParamsPath, err)
+			}
 			mopsoCostPerRequestGauge.WithLabelValues(n1.Name).Set(result.CostPerReq1)
 			mopsoCostPerRequestGauge.WithLabelValues(n2.Name).Set(result.CostPerReq2)
 			mopsoParetoArchiveGauge.Set(float64(len(result.Archive)))
@@ -609,6 +711,21 @@ func envLower(key, fallback string) string {
 	return strings.ToLower(v)
 }
 
+func envDurationMS(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	ms, err := time.ParseDuration(raw)
+	if err == nil {
+		return ms
+	}
+	if n, convErr := time.ParseDuration(raw + "ms"); convErr == nil {
+		return n
+	}
+	return fallback
+}
+
 func main() {
 	ensureDirs("configs", "storage", "logs")
 
@@ -632,11 +749,15 @@ func main() {
 
 	ensureBaseParamsFile(baseFuzzyParamsPath, DefaultBaseFuzzyParams)
 	baseParams := loadFloatArrayWithFallback(baseFuzzyParamsPath, DefaultBaseFuzzyParams, "base fuzzy params")
+	baseParams = sanitizeFuzzyParams(baseParams)
 
 	StaticFuzzyEngine = fuzzy.NewEngine(baseParams)
-	AdaptiveFMOPSOEngine = fuzzy.NewEngine(baseParams)
+	activeFMOPSOParams := loadFloatArrayWithFallback(fmopsoParamsPath, baseParams, "parameter adaptif F-MOPSO")
+	activeFMOPSOParams = sanitizeFuzzyParams(activeFMOPSOParams)
+	AdaptiveFMOPSOEngine = fuzzy.NewEngine(activeFMOPSOParams)
 
 	activePSOParams := loadFloatArrayWithFallback(psoParamsPath, baseParams, "parameter adaptif F-PSO")
+	activePSOParams = sanitizeFuzzyParams(activePSOParams)
 	AdaptiveFPSOEngine = fuzzy.NewEngine(activePSOParams)
 
 	backendDNS := []string{"http://api-node1:8080", "http://api-node2:8080"}
@@ -644,8 +765,14 @@ func main() {
 
 	pool := &NodePool{
 		client:    metricsClient,
-		algorithm: envLower("LB_ALGO", "fpso"),
+		algorithm: envLower("LB_ALGO", "fuzzy"),
 		mopsoMode: envLower("MOPSO_BUSINESS_MODE", "balanced"),
+	}
+	switch pool.algorithm {
+	case "roundrobin", "fuzzy", "fmopso":
+	default:
+		log.Printf("[WARNING] LB_ALGO=%s tidak valid, fallback ke fuzzy", pool.algorithm)
+		pool.algorithm = "fuzzy"
 	}
 	if mopsoFile != nil {
 		pool.mopsoLog = log.New(mopsoFile, "", log.LstdFlags)
@@ -657,13 +784,21 @@ func main() {
 			log.Fatalf("Gagal mem-parse URL backend: %v", err)
 		}
 		nodeName := fmt.Sprintf("api-node%d", i+1)
-		pool.nodes = append(pool.nodes, &Node{Name: nodeName, URL: backendURL})
+		pool.nodes = append(pool.nodes, &Node{Name: nodeName, URL: backendURL, CPUCapacity: 100})
 		log.Printf("Mendaftarkan backend node: %s di %s\n", nodeName, backendURL)
 	}
 
-	pool.startMetricsCollector(200 * time.Millisecond)
-	pool.startPSOOptimizer(5 * time.Second)
-	pool.startMOPSOOptimizer(5 * time.Second)
+	metricsInterval := envDurationMS("METRICS_INTERVAL", 200*time.Millisecond)
+	optimizerInterval := envDurationMS("OPTIMIZER_INTERVAL", 1*time.Second)
+	pool.startMetricsCollector(metricsInterval)
+	switch pool.algorithm {
+	case "fmopso":
+		pool.startMOPSOOptimizer(optimizerInterval)
+	case "fuzzy", "roundrobin":
+		log.Printf("[OPTIMIZER] Mode %s aktif, worker optimizer dilewati", pool.algorithm)
+	default:
+		log.Printf("[OPTIMIZER] ALGO=%s tidak didukung optimizer, worker dilewati", pool.algorithm)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
@@ -677,7 +812,7 @@ func main() {
 		proxy.ServeHTTP(w, r)
 	})
 
-	log.Printf("Memulai Load Balancer di port :8080 (ALGO=%s, MOPSO_MODE=%s)...", pool.algorithm, pool.mopsoMode)
+	log.Printf("Memulai Load Balancer di port :8080 (ALGO=%s, MOPSO_MODE=%s, METRICS_INTERVAL=%s, OPT_INTERVAL=%s)...", pool.algorithm, pool.mopsoMode, metricsInterval, optimizerInterval)
 	server := &http.Server{
 		Addr:         ":8080",
 		Handler:      mux,

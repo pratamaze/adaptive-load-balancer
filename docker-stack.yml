@@ -7,6 +7,8 @@ services:
     environment:
       - LB_ALGO=fmopso
       - MOPSO_BUSINESS_MODE=balanced
+      - OPTIMIZER_INTERVAL=1s
+      - METRICS_INTERVAL=250ms
     ports:
       - "80:8080" # Akses publik masuk lewat port 80 VPS Node 3
     networks:
@@ -23,6 +25,8 @@ services:
   # 2. Backend API Node 1 (Kinerja Penuh 100%)
   api-node1:
     image: pratamaze/api-service:v1.1 
+    environment:
+      - CPU_LIMIT_PERCENT=100
     networks:
       - lb-net
     command: ["/apiservice", "-name", "API-NODE-1"] 
@@ -39,6 +43,8 @@ services:
   # 3. Backend API Node 2 (Simulasi Heterogen: Kinerja 50%)
   api-node2:
     image: pratamaze/api-service:v1.1 
+    environment:
+      - CPU_LIMIT_PERCENT=50
     networks:
       - lb-net
     command: ["/apiservice", "-name", "API-NODE-2"]
