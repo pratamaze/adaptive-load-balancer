@@ -8,12 +8,13 @@ import (
 
 // Parameter statis yang di-hardcode berdasarkan proposal TA
 const (
-	W            = 0.5 // Inertia weight
-	C1           = 1.5 // Cognitive parameter
-	C2           = 1.5 // Social parameter
-	Dimensions   = 27  // Jumlah parameter Fuzzy (x[27])
-	NumParticles = 10  // Jumlah partikel P = {p1, p2, ..., p10}
-	Iterations   = 300 // n_iter
+	InertiaMaxW  = 0.90 // eksplorasi awal
+	InertiaMinW  = 0.38 // eksploitasi akhir
+	C1           = 1.20 // Cognitive parameter
+	C2           = 2.00 // Social parameter
+	Dimensions   = 27   // Jumlah parameter Fuzzy (x[27])
+	NumParticles = 18   // Jumlah partikel P = {p1, p2, ..., p18}
+	Iterations   = 520  // n_iter
 )
 
 // Particle merepresentasikan p dalam P
@@ -70,6 +71,7 @@ func NewSwarm(initialFLParams []float64, fitnessFunc func([]float64) float64) *S
 func (s *Swarm) Optimize() []float64 {
 	// 1: For t in n_iter:
 	for t := 0; t < Iterations; t++ {
+		w := InertiaMaxW - (InertiaMaxW-InertiaMinW)*(float64(t)/float64(Iterations-1))
 
 		// 2: For each particle p in P:
 		for _, p := range s.Particles {
@@ -97,7 +99,7 @@ func (s *Swarm) Optimize() []float64 {
 				r2 := rand.Float64()
 
 				// 9: vi(t+1) = w*vi(t) + c1*r1*(pbesti - xi(t)) + c2*r2*(gbest - xi(t))
-				p.V[d] = (W * p.V[d]) +
+				p.V[d] = (w * p.V[d]) +
 					(C1 * r1 * (p.PBest[d] - p.X[d])) +
 					(C2 * r2 * (s.GBest[d] - p.X[d]))
 
