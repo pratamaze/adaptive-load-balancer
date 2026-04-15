@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "entry-point-load-balancer"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["entry-point:8080"]
+
+  - job_name: "api-node1"
+    metrics_path: /metrics/prometheus
+    dns_sd_configs:
+      - names: ["tasks.api-node1"]
+        type: A
+        port: 8080
+
+  - job_name: "api-node2"
+    metrics_path: /metrics/prometheus
+    dns_sd_configs:
+      - names: ["tasks.api-node2"]
+        type: A
+        port: 8080

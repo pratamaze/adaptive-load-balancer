@@ -8,40 +8,45 @@ func Fuzzify(val float64, mf Triple) float64 {
 		return 0.0
 	}
 	if val < mf.B {
-		return (val - mf.A) / (mf.B - mf.A)
+		den := mf.B - mf.A
+		if den == 0 {
+			return 0
+		}
+		return (val - mf.A) / den
 	}
-	return (mf.C - val) / (mf.C - mf.B)
+	den := mf.C - mf.B
+	if den == 0 {
+		return 0
+	}
+	return (mf.C - val) / den
 }
 
 // Map Indeks: CPU (0-8)
 func (e *Engine) GetCPULevel(val float64) map[string]float64 {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	params := e.GetParams()
 	return map[string]float64{
-		"Rendah": Fuzzify(val, Triple{e.Params[0], e.Params[1], e.Params[2]}),
-		"Sedang": Fuzzify(val, Triple{e.Params[3], e.Params[4], e.Params[5]}),
-		"Tinggi": Fuzzify(val, Triple{e.Params[6], e.Params[7], e.Params[8]}),
+		"Rendah": Fuzzify(val, Triple{params[0], params[1], params[2]}),
+		"Sedang": Fuzzify(val, Triple{params[3], params[4], params[5]}),
+		"Tinggi": Fuzzify(val, Triple{params[6], params[7], params[8]}),
 	}
 }
 
 // Map Indeks: Queue (9-17)
 func (e *Engine) GetQueueLevel(val float64) map[string]float64 {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	params := e.GetParams()
 	return map[string]float64{
-		"Rendah": Fuzzify(val, Triple{e.Params[9], e.Params[10], e.Params[11]}),
-		"Sedang": Fuzzify(val, Triple{e.Params[12], e.Params[13], e.Params[14]}),
-		"Tinggi": Fuzzify(val, Triple{e.Params[15], e.Params[16], e.Params[17]}),
+		"Rendah": Fuzzify(val, Triple{params[9], params[10], params[11]}),
+		"Sedang": Fuzzify(val, Triple{params[12], params[13], params[14]}),
+		"Tinggi": Fuzzify(val, Triple{params[15], params[16], params[17]}),
 	}
 }
 
 // Map Indeks: Response Time (18-26)
 func (e *Engine) GetRespLevel(val float64) map[string]float64 {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	params := e.GetParams()
 	return map[string]float64{
-		"Cepat":  Fuzzify(val, Triple{e.Params[18], e.Params[19], e.Params[20]}),
-		"Normal": Fuzzify(val, Triple{e.Params[21], e.Params[22], e.Params[23]}),
-		"Lambat": Fuzzify(val, Triple{e.Params[24], e.Params[25], e.Params[26]}),
+		"Cepat":  Fuzzify(val, Triple{params[18], params[19], params[20]}),
+		"Normal": Fuzzify(val, Triple{params[21], params[22], params[23]}),
+		"Lambat": Fuzzify(val, Triple{params[24], params[25], params[26]}),
 	}
 }
