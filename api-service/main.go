@@ -7,85 +7,104 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shirou/gopsutil/v3/load"
-	"github.com/shirou/gopsutil/v3/process" // Package metrik spesifik container
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 var nodeName string
+var hostName string
 var myProcess *process.Process
 var (
-	cachedCPU  float64
-	cpuMutex   sync.RWMutex
-	cpuHistory []float64 // Menyimpan riwayat beberapa metrik terakhir
+	cachedCPU          float64
+	cpuMutex           sync.RWMutex
+	cpuHistory         []float64
+	cpuLimitPercent    = 100.0
+	inflightRequests   atomic.Int64
+	requestLatencyEWMA atomic.Uint64
+)
+
+var (
+	apiRequestTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "api_http_requests_total",
+			Help: "Total request HTTP per replica API",
+		},
+		[]string{"backend_server", "node_name", "method", "path", "status"},
+	)
+	apiRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "api_http_request_duration_seconds",
+			Help:    "Durasi request HTTP per replica API",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"backend_server", "node_name", "method", "path", "status"},
+	)
 )
 
 func init() {
+	prometheus.MustRegister(apiRequestTotal)
+	prometheus.MustRegister(apiRequestDuration)
+
 	var err error
+	hostName, err = os.Hostname()
+	if err != nil || strings.TrimSpace(hostName) == "" {
+		hostName = "unknown-host"
+	}
+
 	myProcess, err = process.NewProcess(int32(os.Getpid()))
 	if err != nil {
 		log.Printf("[WARNING] Gagal inisialisasi pembaca metrik Container: %v", err)
 	}
 
 	if myProcess != nil {
-		// inisialisasi awal gopsutil
 		myProcess.Percent(0)
-
-		//  Background Worker untuk menghitung CPU layaknya Docker Stats (Tiap 1 detik)
+		cpuLimitPercent = parseCPULimitPercent()
 		go startCPUMonitor()
 	}
 }
 
-// Pekerja di background yang merata-ratakan CPU setiap 1 detik
-func startCPUMonitor() {
-	ticker := time.NewTicker(200 * time.Millisecond)
-
-	// Batas history adalah 5 (5 x 200ms = 1000ms / 1 detik)
-	const windowSize = 5
-
+func parseCPULimitPercent() float64 {
 	limitStr := os.Getenv("CPU_LIMIT_PERCENT")
 	cpuLimit, err := strconv.ParseFloat(limitStr, 64)
 	if err != nil || cpuLimit <= 0 {
-		cpuLimit = 100.0
+		return 100.0
 	}
+	return cpuLimit
+}
+
+func startCPUMonitor() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	const windowSize = 5
 
 	for range ticker.C {
 		val, err := myProcess.Percent(0)
 		if err == nil {
-
-			// NORMALISASI DINAMIS
-			scaledVal := (val / cpuLimit) * 100.0
-
-			// Cegah nilai lebih dari 100% jika ada lonjakan mikro dari Linux
+			scaledVal := (val / cpuLimitPercent) * 100.0
 			if scaledVal > 100.0 {
 				scaledVal = 100.0
 			}
 
 			cpuMutex.Lock()
-
-			// Masukkan data *hasil normalisasi* ke dalam riwayat
 			cpuHistory = append(cpuHistory, scaledVal)
-
-			// Jika riwayat lebih dari 5, hapus data yang paling tua (ujung kiri)
 			if len(cpuHistory) > windowSize {
 				cpuHistory = cpuHistory[1:]
 			}
-
-			// Hitung rata-rata dari seluruh riwayat saat ini
 			sum := 0.0
 			for _, v := range cpuHistory {
 				sum += v
 			}
-
-			// Simpan hasil rata-rata ke cache untuk dibaca oleh Load Balancer
 			cachedCPU = sum / float64(len(cpuHistory))
-
 			cpuMutex.Unlock()
 		}
 	}
@@ -99,14 +118,36 @@ type ResponseData struct {
 }
 
 type NodeMetrics struct {
-	NodeName     string  `json:"node_name"`
-	CPUUsage     float64 `json:"cpu_usage"`      // Persentase CPU
-	MemoryUsage  float64 `json:"memory_usage"`   // Persentase Memori
-	LoadAverage1 float64 `json:"load_average_1"` // Rata-rata Beban 1 Menit
+	NodeName         string  `json:"node_name"`
+	CPUUsage         float64 `json:"cpu_usage"`
+	MemoryUsage      float64 `json:"memory_usage"`
+	LoadAverage1     float64 `json:"load_average_1"`
+	RequestLatencyMS float64 `json:"request_latency_ms"`
+	InflightRequests float64 `json:"inflight_requests"`
+	CPUCapacity      float64 `json:"cpu_capacity_percent"`
 }
 
-// HANDLER METRIK
-func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
+func loadRequestLatencyEWMA() float64 {
+	return math.Float64frombits(requestLatencyEWMA.Load())
+}
+
+func updateRequestLatencyEWMA(sampleMS float64) {
+	const alpha = 0.25
+	for {
+		currentBits := requestLatencyEWMA.Load()
+		current := math.Float64frombits(currentBits)
+		next := sampleMS
+		if current > 0 {
+			next = alpha*sampleMS + (1-alpha)*current
+		}
+		nextBits := math.Float64bits(next)
+		if requestLatencyEWMA.CompareAndSwap(currentBits, nextBits) {
+			return
+		}
+	}
+}
+
+func metricsJSONHandler(w http.ResponseWriter, r *http.Request, name string) {
 	var cpuUsage float64
 	var memUsage float32
 
@@ -127,19 +168,20 @@ func metricsHandler(w http.ResponseWriter, r *http.Request, name string) {
 		loadAvg1 = loadAvg.Load1
 	}
 
-	// respons metrik
 	metrics := NodeMetrics{
-		NodeName:     name,
-		CPUUsage:     cpuUsage,
-		MemoryUsage:  float64(memUsage),
-		LoadAverage1: loadAvg1,
+		NodeName:         name,
+		CPUUsage:         cpuUsage,
+		MemoryUsage:      float64(memUsage),
+		LoadAverage1:     loadAvg1,
+		RequestLatencyMS: loadRequestLatencyEWMA(),
+		InflightRequests: float64(inflightRequests.Load()),
+		CPUCapacity:      cpuLimitPercent,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(metrics)
+	_ = json.NewEncoder(w).Encode(metrics)
 }
 
-// POST /process -> Simulasi Upload & Komputasi Kriptografi (CPU Bound)
 func dataProcessHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Gunakan method POST", http.StatusMethodNotAllowed)
@@ -147,8 +189,6 @@ func dataProcessHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	startTime := time.Now()
-
-	// Baca data dari load generator
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Gagal membaca body", http.StatusInternalServerError)
@@ -156,22 +196,17 @@ func dataProcessHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// SIMULASI BEBAN CPU: Hashing berulang 50 kali
-	hashResult := ""
 	var hash [32]byte
 	for i := 0; i < 6000; i++ {
 		hash = sha256.Sum256(body)
-
 	}
-	hashResult = fmt.Sprintf("%x", hash)
 
 	duration := time.Since(startTime)
+	hashResult := fmt.Sprintf("%x", hash)
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "[%s] Sukses memproses %d KB. Waktu: %v | Hash: %s\n",
-		nodeName, len(body)/1024, duration, hashResult[:10])
+	_, _ = fmt.Fprintf(w, "[%s] Sukses memproses %d KB. Waktu: %v | Hash: %s\n", nodeName, len(body)/1024, duration, hashResult[:10])
 }
 
-// GET /fetch -> Simulasi Download & String Builder (CPU & Memory Bound)
 func dataFetchHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Gunakan method GET", http.StatusMethodNotAllowed)
@@ -179,29 +214,150 @@ func dataFetchHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sizeStr := r.URL.Query().Get("kb")
-	sizeKB := 50 // Default 50 KB
+	sizeKB := 50
 	if s, err := strconv.Atoi(sizeStr); err == nil && s > 0 {
 		sizeKB = s
 	}
-
 	if sizeKB > 500 {
 		sizeKB = 500
 	}
 
-	// SIMULASI BEBAN CPU: Membangun string besar
 	var builder strings.Builder
 	builder.Grow(sizeKB * 1024)
 
 	baseString := "DATA-METRIK-SKRIPSI-PSO-"
 	repeatCount := (sizeKB * 1024) / len(baseString)
-
 	for i := 0; i < repeatCount; i++ {
 		builder.WriteString(baseString)
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(builder.String()))
+	_, _ = w.Write([]byte(builder.String()))
+}
+
+type StressResponse struct {
+	NodeName       string  `json:"node_name"`
+	BackendServer  string  `json:"backend_server"`
+	TargetMS       int     `json:"target_ms"`
+	DurationMS     float64 `json:"duration_ms"`
+	PrimesComputed int     `json:"primes_computed"`
+	LastPrime      int     `json:"last_prime"`
+}
+
+func isPrime(n int) bool {
+	if n < 2 {
+		return false
+	}
+	if n == 2 {
+		return true
+	}
+	if n%2 == 0 {
+		return false
+	}
+	limit := int(math.Sqrt(float64(n)))
+	for i := 3; i <= limit; i += 2 {
+		if n%i == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// GET /api/stress-test
+// Beban CPU sintetis terkontrol untuk memicu contention (default ~75ms/request).
+func stressTestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Gunakan method GET", http.StatusMethodNotAllowed)
+		return
+	}
+
+	targetMS := 75
+	if q := r.URL.Query().Get("ms"); q != "" {
+		if v, err := strconv.Atoi(q); err == nil {
+			targetMS = v
+		}
+	}
+	if targetMS < 50 {
+		targetMS = 50
+	}
+	if targetMS > 150 {
+		targetMS = 150
+	}
+
+	start := time.Now()
+	deadline := start.Add(time.Duration(targetMS) * time.Millisecond)
+
+	candidate := 2
+	primesComputed := 0
+	lastPrime := 2
+	for time.Now().Before(deadline) {
+		if isPrime(candidate) {
+			lastPrime = candidate
+			primesComputed++
+		}
+		candidate++
+	}
+
+	resp := StressResponse{
+		NodeName:       nodeName,
+		BackendServer:  hostName,
+		TargetMS:       targetMS,
+		DurationMS:     float64(time.Since(start).Microseconds()) / 1000.0,
+		PrimesComputed: primesComputed,
+		LastPrime:      lastPrime,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func withBackendHeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Backend-Server", hostName)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func withPrometheus(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inflightRequests.Add(1)
+		defer inflightRequests.Add(-1)
+
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		durationSeconds := time.Since(start).Seconds()
+		durationMS := durationSeconds * 1000.0
+
+		statusStr := strconv.Itoa(rec.status)
+		labels := []string{hostName, nodeName, r.Method, r.URL.Path, statusStr}
+		apiRequestTotal.WithLabelValues(labels...).Inc()
+		apiRequestDuration.WithLabelValues(labels...).Observe(durationSeconds)
+
+		// Endpoint metrik tidak dipakai sebagai sinyal latency bisnis.
+		if r.URL.Path != "/metrics" && r.URL.Path != "/metrics/prometheus" {
+			updateRequestLatencyEWMA(durationMS)
+		}
+	})
+}
+
+func chain(h http.Handler, mws ...func(http.Handler) http.Handler) http.Handler {
+	for i := len(mws) - 1; i >= 0; i-- {
+		h = mws[i](h)
+	}
+	return h
 }
 
 func main() {
@@ -210,10 +366,11 @@ func main() {
 	nodeName = *nName
 
 	port := "8080"
-	log.Printf("Starting API Service di port %s dengan nama: %s\n", port, nodeName)
+	log.Printf("Starting API Service di port %s dengan nama: %s (hostname: %s)\n", port, nodeName, hostName)
 
-	// Route Root
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		data := ResponseData{
 			Message:   fmt.Sprintf("Request %s berhasil ditangani", r.Method),
 			NodeName:  nodeName,
@@ -222,20 +379,31 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(data)
+		_ = json.NewEncoder(w).Encode(data)
 	})
 
-	// Route Metrik
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		metricsHandler(w, r, nodeName)
+	// Endpoint JSON internal untuk load-balancer collector.
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		metricsJSONHandler(w, r, nodeName)
 	})
 
-	// Route Pengujian CPU (Untuk JMeter)
-	http.HandleFunc("/process", dataProcessHandler)
-	http.HandleFunc("/fetch", dataFetchHandler)
+	// Endpoint Prometheus untuk observability per replika.
+	mux.Handle("/metrics/prometheus", promhttp.Handler())
 
-	// Mulai server
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	mux.HandleFunc("/process", dataProcessHandler)
+	mux.HandleFunc("/fetch", dataFetchHandler)
+	mux.HandleFunc("/api/stress-test", stressTestHandler)
+
+	handler := chain(mux, withBackendHeader, withPrometheus)
+
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      handler,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 15 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Gagal memulai server di port %s: %v", port, err)
 	}
 }
