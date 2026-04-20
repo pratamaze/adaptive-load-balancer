@@ -5,7 +5,11 @@ services:
   entry-point:
     image: pratamaze/entry-point:fmopso 
     environment:
-      - LB_ALGO=fmopso
+      - LB_ALGO=fuzzy
+      - ACTIVE_ALGO=FUZZY_MANUAL
+      - FUZZY_CONFIG_PATH=configs/base_fuzzy_params.json
+      - TRAFFIC_LOG_MODE=per_hit
+      - TRAFFIC_LOG_INTERVAL=1s
       - MOPSO_BUSINESS_MODE=balanced
       - OPTIMIZER_INTERVAL=1s
       - METRICS_INTERVAL=250ms
@@ -13,8 +17,10 @@ services:
       - "80:8080" # Akses publik masuk lewat port 80 VPS Node 3
     networks:
       - lb-net
-    volumes : 
-      - /root/load-balancer/logs:/logs
+    working_dir: /app
+    volumes:
+      - /home/ripe/load-balancer/logs:/app/logs
+      - /home/ripe/load-balancer/configs:/app/configs
     deploy:
       mode: replicated
       replicas: 1

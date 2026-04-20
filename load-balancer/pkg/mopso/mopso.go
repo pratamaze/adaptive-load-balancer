@@ -518,6 +518,38 @@ func fuzzyScore(params []float64, cpu, q, rt float64) float64 {
 }
 
 func fuzzify(v, a, b, c float64) float64 {
+	const eps = 1e-6
+
+	// Left shoulder (a ~= b): membership penuh di sisi kiri.
+	if math.Abs(b-a) <= eps {
+		if v <= b {
+			return 1
+		}
+		if v >= c {
+			return 0
+		}
+		den := c - b
+		if den <= eps {
+			return 0
+		}
+		return (c - v) / den
+	}
+
+	// Right shoulder (b ~= c): membership penuh di sisi kanan.
+	if math.Abs(c-b) <= eps {
+		if v >= b {
+			return 1
+		}
+		if v <= a {
+			return 0
+		}
+		den := b - a
+		if den <= eps {
+			return 0
+		}
+		return (v - a) / den
+	}
+
 	if v == b {
 		return 1
 	}

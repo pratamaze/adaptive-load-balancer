@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,13 +30,15 @@ import (
 var lastRequestTime atomic.Int64
 
 const (
-	baseFuzzyParamsPath = "configs/base_fuzzy_params.json"
-	psoParamsPath       = "storage/pso_params.json"
-	fmopsoParamsPath    = "storage/fmopso_params.json"
-	paretoFrontPath     = "storage/pareto_front.json"
-	mainLogPath         = "logs/hasil_fpso.log"
-	mopsoLogPath        = "logs/mopso_historical.log"
-	osIdleCPU10         = 10.0
+	baseFuzzyParamsPath      = "configs/base_fuzzy_params.json"
+	optimizedFuzzyParamsPath = "configs/optimized_fuzzy_params.json"
+	psoParamsPath            = "storage/pso_params.json"
+	fmopsoParamsPath         = "storage/fmopso_params.json"
+	paretoFrontPath          = "storage/pareto_front.json"
+	mainLogPath              = "logs/hasil_fpso.log"
+	mopsoLogPath             = "logs/mopso_historical.log"
+	trafficDatasetPath       = "logs/traffic_dataset.csv"
+	osIdleCPU10              = 10.0
 )
 
 // Harus sama dengan yang ada di api-service.
@@ -66,12 +70,135 @@ type Node struct {
 
 // NodePool menampung node-node backend.
 type NodePool struct {
-	nodes      []*Node
-	client     *http.Client
-	algorithm  string
-	mopsoMode  string
-	mopsoLogMu sync.Mutex
-	mopsoLog   *log.Logger
+	nodes         []*Node
+	client        *http.Client
+	algorithm     string
+	mopsoMode     string
+	mopsoLogMu    sync.Mutex
+	mopsoLog      *log.Logger
+	trafficLogger *TrafficDatasetLogger
+}
+
+type TrafficDatasetLogger struct {
+	path               string
+	mode               string
+	windowRequests     atomic.Int64
+	windowCostMicroSum atomic.Int64
+	writeMu            sync.Mutex
+}
+
+func NewTrafficDatasetLogger(path, mode string) *TrafficDatasetLogger {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	if m == "" {
+		m = "window"
+	}
+	if m != "window" && m != "per_hit" {
+		m = "window"
+	}
+	return &TrafficDatasetLogger{
+		path: path,
+		mode: m,
+	}
+}
+
+func (t *TrafficDatasetLogger) Observe(costPerReq float64) {
+	if costPerReq < 0 {
+		costPerReq = 0
+	}
+	if t.mode == "per_hit" {
+		if err := t.appendRow(time.Now(), 1, costPerReq); err != nil {
+			log.Printf("[TRAFFIC-LOGGER] gagal append per-hit: %v", err)
+		}
+		return
+	}
+	t.windowRequests.Add(1)
+	t.windowCostMicroSum.Add(int64(costPerReq * 1_000_000))
+}
+
+func (t *TrafficDatasetLogger) Start(interval time.Duration) {
+	if err := t.ensureCSVHeader(); err != nil {
+		log.Printf("[TRAFFIC-LOGGER] gagal menyiapkan CSV %s: %v", t.path, err)
+		return
+	}
+	if t.mode == "per_hit" {
+		log.Printf("[TRAFFIC-LOGGER] mode=per_hit, setiap DECISION ditulis langsung")
+		return
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for now := range ticker.C {
+			req := t.windowRequests.Swap(0)
+			costMicro := t.windowCostMicroSum.Swap(0)
+			if req <= 0 {
+				continue
+			}
+			avgCost := 0.0
+			avgCost = float64(costMicro) / 1_000_000.0 / float64(req)
+			if err := t.appendRow(now, req, avgCost); err != nil {
+				log.Printf("[TRAFFIC-LOGGER] gagal append row: %v", err)
+			}
+		}
+	}()
+}
+
+func (t *TrafficDatasetLogger) ensureCSVHeader() error {
+	if err := os.MkdirAll(filepath.Dir(t.path), 0o755); err != nil {
+		return err
+	}
+	content, err := os.ReadFile(t.path)
+	if err == nil && len(content) > 0 {
+		firstLine := string(content)
+		if idx := strings.IndexByte(firstLine, '\n'); idx >= 0 {
+			firstLine = firstLine[:idx]
+		}
+		firstLine = strings.TrimSpace(strings.TrimPrefix(firstLine, "\ufeff"))
+		if strings.EqualFold(firstLine, "Timestamp,TotalRequests,AvgCostPerReq") {
+			return nil
+		}
+		// File lama tanpa header: prepend header agar kompatibel trainer.
+		withHeader := append([]byte("Timestamp,TotalRequests,AvgCostPerReq\n"), content...)
+		return os.WriteFile(t.path, withHeader, 0o666)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	file, err := os.OpenFile(t.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	w := csv.NewWriter(file)
+	if err := w.Write([]string{"Timestamp", "TotalRequests", "AvgCostPerReq"}); err != nil {
+		return err
+	}
+	w.Flush()
+	return w.Error()
+}
+
+func (t *TrafficDatasetLogger) appendRow(ts time.Time, totalReq int64, avgCost float64) error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+
+	file, err := os.OpenFile(t.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	w := csv.NewWriter(file)
+	row := []string{
+		ts.Format(time.RFC3339),
+		strconv.FormatInt(totalReq, 10),
+		strconv.FormatFloat(avgCost, 'f', 8, 64),
+	}
+	if err := w.Write(row); err != nil {
+		return err
+	}
+	w.Flush()
+	return w.Error()
 }
 
 // 27 rules.
@@ -364,6 +491,7 @@ func (p *NodePool) selectBackend_RoundRobin() *Node {
 		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=0.0000] ", node.Name, cpu, queue, lat)
 	}
 	log.Printf("[DECISION] %s==> TERPILIH: %s\n", detailLog, selectedNode.Name)
+	p.observeDecision(selectedNode)
 	return selectedNode
 }
 
@@ -394,6 +522,7 @@ func (p *NodePool) selectBackend_Fuzzy_Static() *Node {
 	}
 	if bestNode != nil {
 		log.Printf("[DECISION] %s ==> TERPILIH (FUZZY): %s\n", detailLog, bestNode.Name)
+		p.observeDecision(bestNode)
 	}
 	return bestNode
 }
@@ -425,6 +554,7 @@ func (p *NodePool) selectBackend_FPSO_Adaptive() *Node {
 	}
 	if bestNode != nil {
 		log.Printf("[DECISION] %s ==> TERPILIH (F-PSO): %s\n", detailLog, bestNode.Name)
+		p.observeDecision(bestNode)
 	}
 	return bestNode
 }
@@ -456,6 +586,7 @@ func (p *NodePool) selectBackend_FMOPSO_Adaptive() *Node {
 	}
 	if bestNode != nil {
 		log.Printf("[DECISION] %s ==> TERPILIH (F-MOPSO): %s\n", detailLog, bestNode.Name)
+		p.observeDecision(bestNode)
 	}
 	return bestNode
 }
@@ -634,6 +765,19 @@ func (p *NodePool) logMOPSO(format string, args ...any) {
 	p.mopsoLog.Printf(format, args...)
 }
 
+func (p *NodePool) observeDecision(node *Node) {
+	if p.trafficLogger == nil || node == nil {
+		return
+	}
+	node.mutex.RLock()
+	costPerReq := node.ResponseTime
+	node.mutex.RUnlock()
+	if costPerReq <= 0 {
+		costPerReq = 1
+	}
+	p.trafficLogger.Observe(costPerReq)
+}
+
 func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 	customTransport := &http.Transport{
 		MaxIdleConns:          10000,
@@ -726,6 +870,17 @@ func envDurationMS(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
+func resolveFuzzyConfig(activeAlgo string) string {
+	switch strings.ToUpper(strings.TrimSpace(activeAlgo)) {
+	case "FUZZY_MOPSO_OFFLINE":
+		return optimizedFuzzyParamsPath
+	case "FUZZY_MANUAL":
+		return baseFuzzyParamsPath
+	default:
+		return baseFuzzyParamsPath
+	}
+}
+
 func main() {
 	ensureDirs("configs", "storage", "logs")
 
@@ -751,7 +906,19 @@ func main() {
 	baseParams := loadFloatArrayWithFallback(baseFuzzyParamsPath, DefaultBaseFuzzyParams, "base fuzzy params")
 	baseParams = sanitizeFuzzyParams(baseParams)
 
-	StaticFuzzyEngine = fuzzy.NewEngine(baseParams)
+	activeAlgo := strings.TrimSpace(os.Getenv("ACTIVE_ALGO"))
+	if activeAlgo == "" {
+		activeAlgo = "FUZZY_MANUAL"
+	}
+	configPath := strings.TrimSpace(os.Getenv("FUZZY_CONFIG_PATH"))
+	if configPath == "" {
+		configPath = resolveFuzzyConfig(activeAlgo)
+	}
+	selectedParams := loadFloatArrayWithFallback(configPath, baseParams, "active fuzzy params")
+	selectedParams = sanitizeFuzzyParams(selectedParams)
+	StaticFuzzyEngine = fuzzy.NewEngine(selectedParams)
+	log.Printf("[CONFIG] ACTIVE_ALGO=%s FUZZY_CONFIG_PATH=%s", activeAlgo, configPath)
+
 	activeFMOPSOParams := loadFloatArrayWithFallback(fmopsoParamsPath, baseParams, "parameter adaptif F-MOPSO")
 	activeFMOPSOParams = sanitizeFuzzyParams(activeFMOPSOParams)
 	AdaptiveFMOPSOEngine = fuzzy.NewEngine(activeFMOPSOParams)
@@ -777,6 +944,14 @@ func main() {
 	if mopsoFile != nil {
 		pool.mopsoLog = log.New(mopsoFile, "", log.LstdFlags)
 	}
+	trafficLogMode := strings.ToLower(strings.TrimSpace(os.Getenv("TRAFFIC_LOG_MODE")))
+	if trafficLogMode == "" {
+		trafficLogMode = "window"
+	}
+	trafficLogInterval := envDurationMS("TRAFFIC_LOG_INTERVAL", 5*time.Second)
+	pool.trafficLogger = NewTrafficDatasetLogger(trafficDatasetPath, trafficLogMode)
+	pool.trafficLogger.Start(trafficLogInterval)
+	log.Printf("[TRAFFIC-LOGGER] aktif -> %s (source=DECISION, mode=%s, interval=%s)", trafficDatasetPath, trafficLogMode, trafficLogInterval)
 
 	for i, dns := range backendDNS {
 		backendURL, err := url.Parse(dns)

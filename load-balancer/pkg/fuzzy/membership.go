@@ -1,6 +1,40 @@
 package fuzzy
 
+import "math"
+
 func Fuzzify(val float64, mf Triple) float64 {
+	const eps = 1e-6
+
+	// Left shoulder (a ~= b): membership penuh di sisi kiri.
+	if math.Abs(mf.B-mf.A) <= eps {
+		if val <= mf.B {
+			return 1.0
+		}
+		if val >= mf.C {
+			return 0.0
+		}
+		den := mf.C - mf.B
+		if den <= eps {
+			return 0
+		}
+		return (mf.C - val) / den
+	}
+
+	// Right shoulder (b ~= c): membership penuh di sisi kanan.
+	if math.Abs(mf.C-mf.B) <= eps {
+		if val >= mf.B {
+			return 1.0
+		}
+		if val <= mf.A {
+			return 0.0
+		}
+		den := mf.B - mf.A
+		if den <= eps {
+			return 0
+		}
+		return (val - mf.A) / den
+	}
+
 	if val == mf.B {
 		return 1.0
 	}
