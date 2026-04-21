@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -10,8 +11,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"load-balancer/pkg/mopso"
 )
@@ -20,6 +23,8 @@ const (
 	baseFuzzyParamsPath      = "configs/base_fuzzy_params.json"
 	optimizedFuzzyParamsPath = "configs/optimized_fuzzy_params.json"
 	trafficDatasetPath       = "logs/traffic_dataset.csv"
+	mainDecisionLogPath      = "logs/hasil_fpso.log"
+	liveDecisionLogPath      = "../logs/hasil_pso_live.log"
 )
 
 type TrafficData struct {
@@ -43,6 +48,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("gagal membaca dataset traffic: %v", err)
 	}
+	if shouldBackfillFromDecisionLogs(dataset) {
+		backfilled, err := readDecisionLogDataset(mainDecisionLogPath, liveDecisionLogPath)
+		if err != nil {
+			log.Fatalf("gagal membaca decision logs: %v", err)
+		}
+		if len(backfilled) > 0 {
+			dataset = append(dataset, backfilled...)
+			log.Printf("decision-log backfill aktif: +%d baris dari log historis", len(backfilled))
+		}
+	}
 	if len(dataset) == 0 {
 		log.Fatalf("dataset kosong: %s", trafficDatasetPath)
 	}
@@ -60,6 +75,18 @@ func main() {
 	log.Printf("dataset rows=%d", len(dataset))
 	log.Printf("knee objective -> f1=%.8f f2=%.8f", knee.Objective.Imbalance, knee.Objective.PeakLoad)
 	log.Printf("saved: %s", optimizedFuzzyParamsPath)
+}
+
+func shouldBackfillFromDecisionLogs(dataset []TrafficData) bool {
+	if len(dataset) == 0 {
+		return true
+	}
+	for _, row := range dataset {
+		if row.TotalRequests > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func trainKneePoint(baseParams []float64, dataset []TrafficData) (KneePoint, error) {
@@ -237,6 +264,120 @@ func parseTrafficRow(rec []string, idxTS, idxReq, idxCost int) (TrafficData, boo
 	return TrafficData{
 		Timestamp:     strings.TrimSpace(rec[idxTS]),
 		TotalRequests: req,
+		AvgCostPerReq: cost,
+	}, true
+}
+
+var (
+	reDecisionTimestamp = regexp.MustCompile(`\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}`)
+	reNodeLatency       = regexp.MustCompile(`\[([a-zA-Z0-9_-]+):[^\]]*?Lat=([0-9]+(?:\.[0-9]+)?)ms`)
+	reSelectedNode      = regexp.MustCompile(`TERPILIH(?:\s*\([^)]+\))?:\s*([a-zA-Z0-9_-]+)`)
+)
+
+func readDecisionLogDataset(paths ...string) ([]TrafficData, error) {
+	rows := make([]TrafficData, 0, 4096)
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		fileRows, err := parseDecisionLogFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		rows = append(rows, fileRows...)
+	}
+	return rows, nil
+}
+
+func parseDecisionLogFile(path string) ([]TrafficData, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	rows := make([]TrafficData, 0, 4096)
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	for scanner.Scan() {
+		row, ok := parseDecisionLogLine(scanner.Text())
+		if !ok {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func parseDecisionLogLine(line string) (TrafficData, bool) {
+	if !strings.Contains(line, "[DECISION]") {
+		return TrafficData{}, false
+	}
+
+	tsMatch := reDecisionTimestamp.FindString(line)
+	if tsMatch == "" {
+		return TrafficData{}, false
+	}
+	parsedTS, err := time.ParseInLocation("2006/01/02 15:04:05", tsMatch, time.Local)
+	if err != nil {
+		return TrafficData{}, false
+	}
+
+	latByNode := map[string]float64{}
+	nodeMatches := reNodeLatency.FindAllStringSubmatch(line, -1)
+	for _, m := range nodeMatches {
+		if len(m) < 3 {
+			continue
+		}
+		lat, err := strconv.ParseFloat(strings.TrimSpace(m[2]), 64)
+		if err != nil {
+			continue
+		}
+		if lat < 0 {
+			lat = 0
+		}
+		latByNode[m[1]] = lat
+	}
+	if len(latByNode) == 0 {
+		return TrafficData{}, false
+	}
+
+	selected := ""
+	if m := reSelectedNode.FindStringSubmatch(line); len(m) >= 2 {
+		selected = m[1]
+	}
+
+	cost := 0.0
+	if selected != "" {
+		if v, ok := latByNode[selected]; ok {
+			cost = v
+		}
+	}
+	if cost <= 0 {
+		var sum float64
+		var count int
+		for _, v := range latByNode {
+			if v <= 0 {
+				continue
+			}
+			sum += v
+			count++
+		}
+		if count == 0 {
+			return TrafficData{}, false
+		}
+		cost = sum / float64(count)
+	}
+
+	return TrafficData{
+		Timestamp:     parsedTS.UTC().Format(time.RFC3339),
+		TotalRequests: 1,
 		AvgCostPerReq: cost,
 	}, true
 }

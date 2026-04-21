@@ -10,6 +10,7 @@ services:
       - FUZZY_CONFIG_PATH=configs/base_fuzzy_params.json
       - TRAFFIC_LOG_MODE=per_hit
       - TRAFFIC_LOG_INTERVAL=1s
+      - TRAFFIC_LOG_ONLY_LOADTEST=true
       - MOPSO_BUSINESS_MODE=balanced
       - OPTIMIZER_INTERVAL=1s
       - METRICS_INTERVAL=250ms

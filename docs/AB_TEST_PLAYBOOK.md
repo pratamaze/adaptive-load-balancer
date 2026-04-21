@@ -22,6 +22,7 @@ Compare baseline fuzzy vs offline-tuned fuzzy fairly, while preventing both back
 Recommended for richer training data:
 - `TRAFFIC_LOG_MODE=per_hit`
 - `TRAFFIC_LOG_INTERVAL=1s` (ignored in `per_hit` mode)
+- `TRAFFIC_LOG_ONLY_LOADTEST=true` (hanya endpoint load test `/api/stress-test` dan `/fetch`)
 
 Alternative low-overhead mode:
 - `TRAFFIC_LOG_MODE=window`

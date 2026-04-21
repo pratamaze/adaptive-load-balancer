@@ -74,6 +74,7 @@ type NodePool struct {
 	client        *http.Client
 	algorithm     string
 	mopsoMode     string
+	trafficOnlyLT bool
 	mopsoLogMu    sync.Mutex
 	mopsoLog      *log.Logger
 	trafficLogger *TrafficDatasetLogger
@@ -491,7 +492,6 @@ func (p *NodePool) selectBackend_RoundRobin() *Node {
 		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=0.0000] ", node.Name, cpu, queue, lat)
 	}
 	log.Printf("[DECISION] %s==> TERPILIH: %s\n", detailLog, selectedNode.Name)
-	p.observeDecision(selectedNode)
 	return selectedNode
 }
 
@@ -522,7 +522,6 @@ func (p *NodePool) selectBackend_Fuzzy_Static() *Node {
 	}
 	if bestNode != nil {
 		log.Printf("[DECISION] %s ==> TERPILIH (FUZZY): %s\n", detailLog, bestNode.Name)
-		p.observeDecision(bestNode)
 	}
 	return bestNode
 }
@@ -554,7 +553,6 @@ func (p *NodePool) selectBackend_FPSO_Adaptive() *Node {
 	}
 	if bestNode != nil {
 		log.Printf("[DECISION] %s ==> TERPILIH (F-PSO): %s\n", detailLog, bestNode.Name)
-		p.observeDecision(bestNode)
 	}
 	return bestNode
 }
@@ -586,7 +584,6 @@ func (p *NodePool) selectBackend_FMOPSO_Adaptive() *Node {
 	}
 	if bestNode != nil {
 		log.Printf("[DECISION] %s ==> TERPILIH (F-MOPSO): %s\n", detailLog, bestNode.Name)
-		p.observeDecision(bestNode)
 	}
 	return bestNode
 }
@@ -765,8 +762,24 @@ func (p *NodePool) logMOPSO(format string, args ...any) {
 	p.mopsoLog.Printf(format, args...)
 }
 
-func (p *NodePool) observeDecision(node *Node) {
+func (p *NodePool) isLoadTestRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	path := strings.TrimSpace(req.URL.Path)
+	switch path {
+	case "/api/stress-test", "/fetch":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *NodePool) observeDecision(node *Node, req *http.Request) {
 	if p.trafficLogger == nil || node == nil {
+		return
+	}
+	if p.trafficOnlyLT && !p.isLoadTestRequest(req) {
 		return
 	}
 	node.mutex.RLock()
@@ -797,6 +810,7 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 				log.Println("Gagal memilih backend, tidak ada node tersedia.")
 				return
 			}
+			pool.observeDecision(backendNode, req)
 
 			backendNode.RequestCount.Add(1)
 			req.URL.Scheme = backendNode.URL.Scheme
@@ -931,9 +945,10 @@ func main() {
 	metricsClient := &http.Client{Timeout: 500 * time.Millisecond}
 
 	pool := &NodePool{
-		client:    metricsClient,
-		algorithm: envLower("LB_ALGO", "fuzzy"),
-		mopsoMode: envLower("MOPSO_BUSINESS_MODE", "balanced"),
+		client:        metricsClient,
+		algorithm:     envLower("LB_ALGO", "fuzzy"),
+		mopsoMode:     envLower("MOPSO_BUSINESS_MODE", "balanced"),
+		trafficOnlyLT: envLower("TRAFFIC_LOG_ONLY_LOADTEST", "true") == "true",
 	}
 	switch pool.algorithm {
 	case "roundrobin", "fuzzy", "fmopso":
@@ -946,12 +961,12 @@ func main() {
 	}
 	trafficLogMode := strings.ToLower(strings.TrimSpace(os.Getenv("TRAFFIC_LOG_MODE")))
 	if trafficLogMode == "" {
-		trafficLogMode = "window"
+		trafficLogMode = "per_hit"
 	}
 	trafficLogInterval := envDurationMS("TRAFFIC_LOG_INTERVAL", 5*time.Second)
 	pool.trafficLogger = NewTrafficDatasetLogger(trafficDatasetPath, trafficLogMode)
 	pool.trafficLogger.Start(trafficLogInterval)
-	log.Printf("[TRAFFIC-LOGGER] aktif -> %s (source=DECISION, mode=%s, interval=%s)", trafficDatasetPath, trafficLogMode, trafficLogInterval)
+	log.Printf("[TRAFFIC-LOGGER] aktif -> %s (source=DECISION, mode=%s, interval=%s, only_loadtest=%t)", trafficDatasetPath, trafficLogMode, trafficLogInterval, pool.trafficOnlyLT)
 
 	for i, dns := range backendDNS {
 		backendURL, err := url.Parse(dns)
