@@ -75,20 +75,11 @@ type evaluator struct {
 	snap       HistoricalSnapshot
 	totalReq   int64
 	costPerReq [2]float64
+	cpuForFuzz [2]float64
 	capacity   [2]float64
 }
 
 func newEvaluator(snap HistoricalSnapshot) evaluator {
-	r1 := maxInt64(snap.Node1.Requests, 1)
-	r2 := maxInt64(snap.Node2.Requests, 1)
-	c1 := (snap.Node1.CPUUsage - snap.OSIdleCPU10) / float64(r1)
-	c2 := (snap.Node2.CPUUsage - snap.OSIdleCPU10) / float64(r2)
-	if c1 < 0 {
-		c1 = 0
-	}
-	if c2 < 0 {
-		c2 = 0
-	}
 	cap1 := snap.Node1.CPUCapacity
 	if cap1 <= 0 {
 		cap1 = 100
@@ -97,17 +88,31 @@ func newEvaluator(snap HistoricalSnapshot) evaluator {
 	if cap2 <= 0 {
 		cap2 = 100
 	}
+	cpuRaw1 := toRawCPU(snap.Node1.CPUUsage, cap1)
+	cpuRaw2 := toRawCPU(snap.Node2.CPUUsage, cap2)
+
+	r1 := maxInt64(snap.Node1.Requests, 1)
+	r2 := maxInt64(snap.Node2.Requests, 1)
+	c1 := (cpuRaw1 - snap.OSIdleCPU10) / float64(r1)
+	c2 := (cpuRaw2 - snap.OSIdleCPU10) / float64(r2)
+	if c1 < 0 {
+		c1 = 0
+	}
+	if c2 < 0 {
+		c2 = 0
+	}
 	return evaluator{
 		snap:       snap,
 		totalReq:   snap.Node1.Requests + snap.Node2.Requests,
 		costPerReq: [2]float64{c1, c2},
+		cpuForFuzz: [2]float64{toNormalizedCPU(snap.Node1.CPUUsage, cap1), toNormalizedCPU(snap.Node2.CPUUsage, cap2)},
 		capacity:   [2]float64{cap1, cap2},
 	}
 }
 
 func (e evaluator) evaluate(params []float64) (Objective, float64, float64) {
-	score1 := fuzzyScore(params, e.snap.Node1.CPUUsage, e.snap.Node1.QueueLength, e.snap.Node1.ResponseTime)
-	score2 := fuzzyScore(params, e.snap.Node2.CPUUsage, e.snap.Node2.QueueLength, e.snap.Node2.ResponseTime)
+	score1 := fuzzyScore(params, e.cpuForFuzz[0], e.snap.Node1.QueueLength, e.snap.Node1.ResponseTime)
+	score2 := fuzzyScore(params, e.cpuForFuzz[1], e.snap.Node2.QueueLength, e.snap.Node2.ResponseTime)
 	totalScore := score1 + score2
 	share1 := 0.5
 	if totalScore > 0 {
@@ -132,25 +137,42 @@ func (e evaluator) evaluate(params []float64) (Objective, float64, float64) {
 		sim2 = 0
 	}
 
-	// Objective disejajarkan ke kapasitas node heterogen.
-	util1 := sim1 / maxFloat(e.capacity[0], 1e-9)
-	util2 := sim2 / maxFloat(e.capacity[1], 1e-9)
-	sumCPU := util1 + util2
-	if sumCPU < 1e-9 {
-		sumCPU = 1e-9
+	// RU mengikuti kapasitas heterogen per node: RU = SimulatedCPU / CPUCapacity.
+	ru1 := sim1 / maxFloat(e.capacity[0], 1e-9)
+	ru2 := sim2 / maxFloat(e.capacity[1], 1e-9)
+	if ru1 < 0 {
+		ru1 = 0
 	}
-	di := math.Abs(util1-util2) / sumCPU
-	hi := math.Max(util1, util2)
-	lo := math.Min(util1, util2)
-	bcu := lo / maxFloat(hi, 1e-9)
-	diPenalty := (2.8 * di * di) + (1.4 * (1.0 - bcu) * (1.0 - bcu))
+	if ru2 < 0 {
+		ru2 = 0
+	}
+
+	// DI harus diminimalkan menuju 0 (selisih absolut antar utilitas).
+	di := math.Abs(ru1 - ru2)
+
+	// BCU secara alami dimaksimalkan (mendekati 1), lalu dibalik jadi penalti untuk minimization.
+	hi := math.Max(ru1, ru2)
+	lo := math.Min(ru1, ru2)
+	bcu := 1.0
+	if hi > 1e-9 {
+		bcu = lo / hi
+	}
+	if bcu < 0 {
+		bcu = 0
+	}
+	if bcu > 1 {
+		bcu = 1
+	}
+	penaltyBCU := 1.0 - bcu
+
+	imbalancePenalty := (2.8 * di * di) + (1.4 * penaltyBCU * penaltyBCU)
 	latTail := math.Max(e.snap.Node1.ResponseTime, e.snap.Node2.ResponseTime) / 1000.0
 	peakPenalty := hi + 0.30*latTail
 
 	// f1 = penalti keseimbangan berbasis DI+BCU.
 	// f2 = penalti puncak utilitas node + latensi tail.
 	obj := Objective{
-		Imbalance: diPenalty,
+		Imbalance: imbalancePenalty,
 		PeakLoad:  peakPenalty,
 	}
 	return obj, sim1, sim2
@@ -407,6 +429,38 @@ func maxFloat(a, b float64) float64 {
 	return b
 }
 
+// toRawCPU mengasumsikan input CPU sudah berupa raw (0..cap) lalu melakukan clamp aman.
+func toRawCPU(cpu, cap float64) float64 {
+	capacity := cap
+	if capacity <= 0 {
+		capacity = 100
+	}
+	if cpu < 0 {
+		return 0
+	}
+	if cpu > capacity {
+		return capacity
+	}
+	return cpu
+}
+
+// toNormalizedCPU mengubah raw CPU ke skala normalized 0..100 berdasarkan kapasitas node.
+func toNormalizedCPU(cpu, cap float64) float64 {
+	capacity := cap
+	if capacity <= 0 {
+		capacity = 100
+	}
+	if cpu < 0 {
+		return 0
+	}
+	raw := toRawCPU(cpu, capacity)
+	norm := (raw / capacity) * 100.0
+	if norm > 100 {
+		return 100
+	}
+	return norm
+}
+
 func clone27(src []float64) []float64 {
 	dst := make([]float64, Dimensions)
 	copy(dst, src)
@@ -419,8 +473,11 @@ func almostEqual(a, b float64) bool {
 }
 
 func repairParams(params []float64) {
-	const eps = 1e-6
 	for i := 0; i+2 < len(params); i += 3 {
+		minGap := 20.0
+		if i <= 8 {
+			minGap = 2.0
+		}
 		a := clamp(params[i], lowerBound(i), upperBound(i))
 		b := clamp(params[i+1], lowerBound(i+1), upperBound(i+1))
 		c := clamp(params[i+2], lowerBound(i+2), upperBound(i+2))
@@ -435,32 +492,32 @@ func repairParams(params []float64) {
 			a, b = b, a
 		}
 
-		if b < a+eps {
-			b = a + eps
+		if b < a+minGap {
+			b = a + minGap
 		}
-		if c < b+eps {
-			c = b + eps
+		if c < b+minGap {
+			c = b + minGap
 		}
 
 		hi := upperBound(i)
 		if c > hi {
 			c = hi
-			if b > c-eps {
-				b = c - eps
+			if b > c-minGap {
+				b = c - minGap
 			}
-			if b < a+eps {
-				a = b - eps
+			if b < a+minGap {
+				a = b - minGap
 			}
 		}
 		lo := lowerBound(i)
 		if a < lo {
 			a = lo
 		}
-		if b < a+eps {
-			b = a + eps
+		if b < a+minGap {
+			b = a + minGap
 		}
-		if c < b+eps {
-			c = b + eps
+		if c < b+minGap {
+			c = b + minGap
 		}
 		if c > hi {
 			c = hi
@@ -469,6 +526,61 @@ func repairParams(params []float64) {
 		params[i] = a
 		params[i+1] = b
 		params[i+2] = c
+	}
+
+	// Jaga urutan label linguistik Low < Medium < High untuk puncak (b) tiap variabel.
+	enforcePeakOrder(params, 0, 2.0, 100.0)   // CPU
+	enforcePeakOrder(params, 9, 20.0, 2000.0) // Queue
+	enforcePeakOrder(params, 18, 20.0, 2000.0)
+}
+
+func enforcePeakOrder(params []float64, start int, minGap, hi float64) {
+	peaks := []float64{params[start+1], params[start+4], params[start+7]}
+	sort.Float64s(peaks)
+	if peaks[1] < peaks[0]+minGap {
+		peaks[1] = peaks[0] + minGap
+	}
+	if peaks[2] < peaks[1]+minGap {
+		peaks[2] = peaks[1] + minGap
+	}
+	if peaks[2] > hi {
+		peaks[2] = hi
+		if peaks[1] > peaks[2]-minGap {
+			peaks[1] = peaks[2] - minGap
+		}
+		if peaks[0] > peaks[1]-minGap {
+			peaks[0] = peaks[1] - minGap
+		}
+	}
+	if peaks[0] < 0 {
+		peaks[0] = 0
+	}
+	params[start+1] = peaks[0]
+	params[start+4] = peaks[1]
+	params[start+7] = peaks[2]
+
+	// Pastikan triangle tetap mengandung puncak dengan lebar minimum.
+	for tri := 0; tri < 3; tri++ {
+		aIdx := start + tri*3
+		bIdx := aIdx + 1
+		cIdx := aIdx + 2
+		b := params[bIdx]
+		lo := lowerBound(aIdx)
+		hiTri := upperBound(aIdx)
+		if params[aIdx] > b-minGap {
+			params[aIdx] = b - minGap
+		}
+		if params[cIdx] < b+minGap {
+			params[cIdx] = b + minGap
+		}
+		params[aIdx] = clamp(params[aIdx], lo, hiTri)
+		params[cIdx] = clamp(params[cIdx], lo, hiTri)
+		if params[aIdx] > b {
+			params[aIdx] = clamp(b-minGap, lo, hiTri)
+		}
+		if params[cIdx] < b {
+			params[cIdx] = clamp(b+minGap, lo, hiTri)
+		}
 	}
 }
 

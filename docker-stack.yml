@@ -3,18 +3,22 @@ version: "3.8"
 services:
   # 1. Entry Point / Load Balancer (Jalan di Manager / Node 3)
   entry-point:
-    image: pratamaze/entry-point:fmopso 
+    image: pratamaze/loadbalancer:fuzzy-mopso 
     environment:
-      - LB_ALGO=fmopso
+      - LB_ALGO=fuzzy
+      - FUZZY_PARAM_SOURCE=optimized
       - MOPSO_BUSINESS_MODE=balanced
+      - TRAFFIC_LOG_MODE=window
       - OPTIMIZER_INTERVAL=1s
       - METRICS_INTERVAL=250ms
     ports:
       - "80:8080" # Akses publik masuk lewat port 80 VPS Node 3
     networks:
       - lb-net
-    volumes : 
-      - /root/load-balancer/logs:/logs
+    volumes :
+      - /home/ripe/load-balancer/logs:/logs
+      - /home/ripe/load-balancer/storage:/storage
+      - /home/ripe/load-balancer/configs:/configs
     deploy:
       mode: replicated
       replicas: 1
@@ -24,7 +28,7 @@ services:
 
   # 2. Backend API Node 1 (Kinerja Penuh 100%)
   api-node1:
-    image: pratamaze/api-service:v1.1 
+    image: pratamaze/nodeapi:fuzzy-mopso 
     environment:
       - CPU_LIMIT_PERCENT=100
     networks:
@@ -39,10 +43,13 @@ services:
         constraints:
           # Pastikan ini sesuai dengan nama hostname VPS Node 1 kamu saat di-cek dengan 'hostname'
           - node.hostname == node1.server
+      resources:
+        limits:
+          cpus: '1.0' # Menetapkan baseline kapasitas fisik penuh untuk node referensi.
 
   # 3. Backend API Node 2 (Simulasi Heterogen: Kinerja 50%)
   api-node2:
-    image: pratamaze/api-service:v1.1 
+    image: pratamaze/nodeapi:fuzzy-mopso 
     environment:
       - CPU_LIMIT_PERCENT=50
     networks:

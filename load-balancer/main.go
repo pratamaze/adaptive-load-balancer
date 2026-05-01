@@ -29,6 +29,7 @@ var lastRequestTime atomic.Int64
 
 const (
 	baseFuzzyParamsPath = "configs/base_fuzzy_params.json"
+	optimizedFuzzyPath  = "configs/optimized_fuzzy_params.json"
 	psoParamsPath       = "storage/pso_params.json"
 	fmopsoParamsPath    = "storage/fmopso_params.json"
 	paretoFrontPath     = "storage/pareto_front.json"
@@ -39,13 +40,15 @@ const (
 
 // Harus sama dengan yang ada di api-service.
 type NodeMetrics struct {
-	NodeName         string  `json:"node_name"`
-	CPUUsage         float64 `json:"cpu_usage"`
-	MemoryUsage      float64 `json:"memory_usage"`
-	LoadAverage1     float64 `json:"load_average_1"`
-	RequestLatencyMS float64 `json:"request_latency_ms"`
-	InflightRequests float64 `json:"inflight_requests"`
-	CPUCapacity      float64 `json:"cpu_capacity_percent"`
+	NodeName           string  `json:"node_name"`
+	CPUUsage           float64 `json:"cpu_usage"`
+	CPUUsageRaw        float64 `json:"cpu_usage_raw"`
+	CPUUsageNormalized float64 `json:"cpu_usage_normalized"`
+	MemoryUsage        float64 `json:"memory_usage"`
+	LoadAverage1       float64 `json:"load_average_1"`
+	RequestLatencyMS   float64 `json:"request_latency_ms"`
+	InflightRequests   float64 `json:"inflight_requests"`
+	CPUCapacity        float64 `json:"cpu_capacity_percent"`
 }
 
 // backend service.
@@ -54,6 +57,7 @@ type Node struct {
 	URL  *url.URL
 
 	CPUUsage     float64
+	CPURawUsage  float64
 	LoadAverage  float64
 	InflightReq  float64
 	MemoryUsage  float64
@@ -66,13 +70,17 @@ type Node struct {
 
 // NodePool menampung node-node backend.
 type NodePool struct {
-	nodes      []*Node
-	client     *http.Client
-	algorithm  string
-	mopsoMode  string
-	mopsoLogMu sync.Mutex
-	mopsoLog   *log.Logger
+	nodes          []*Node
+	client         *http.Client
+	algorithm      string
+	mopsoMode      string
+	paramProfile   string
+	trafficLogMode string
+	mopsoLogMu     sync.Mutex
+	mopsoLog       *log.Logger
 }
+
+const selectedNodeTraceHeader = "X-LB-Selected-Node"
 
 // 27 rules.
 var myRules = []fuzzy.Rule{
@@ -239,9 +247,9 @@ func evaluateFitnessRealtime(params []float64, n1, n2 *Node) float64 {
 		}
 	}
 
-	cap1 := math.Max(n1.CPUCapacity, 1)
-	cap2 := math.Max(n2.CPUCapacity, 1)
-	totalNormCPU := (n1.CPUUsage / cap1) + (n2.CPUUsage / cap2)
+	norm1 := math.Max(0, math.Min(1, n1.CPUUsage/100.0))
+	norm2 := math.Max(0, math.Min(1, n2.CPUUsage/100.0))
+	totalNormCPU := norm1 + norm2
 	if totalNormCPU < 1e-6 {
 		totalNormCPU = 1e-6
 	}
@@ -259,11 +267,19 @@ func evaluateFitnessRealtime(params []float64, n1, n2 *Node) float64 {
 
 	// Align reward: node dengan CPU lebih tinggi seharusnya mendapat skor fuzzy lebih rendah.
 	align := 0.0
-	if (n1.CPUUsage/cap1-n2.CPUUsage/cap2)*(score1-score2) < 0 {
+	if (norm1-norm2)*(score1-score2) < 0 {
 		align = 0.35
 	}
 
 	return balanceReward - penalty + align
+}
+
+func (p *NodePool) activeParamProfile() string {
+	profile := strings.TrimSpace(p.paramProfile)
+	if profile == "" {
+		return "UNKNOWN"
+	}
+	return strings.ToUpper(profile)
 }
 
 func (p *NodePool) getRealNodeMetrics(node *Node) {
@@ -278,8 +294,13 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 	defer node.mutex.Unlock()
 
 	if err != nil {
-		log.Printf("[METRIC] Gagal mengambil metrik dari %s: %v\n", node.Name, err)
+		log.Printf("[METRIC][SRC=%s] Gagal mengambil metrik dari %s: %v\n", p.activeParamProfile(), node.Name, err)
 		node.CPUUsage = 100.0
+		if node.CPUCapacity > 0 {
+			node.CPURawUsage = node.CPUCapacity
+		} else {
+			node.CPURawUsage = 100.0
+		}
 		node.ResponseTime = 99999.0
 		return
 	}
@@ -287,17 +308,34 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		log.Printf("[METRIC] Gagal membaca body dari %s: %v\n", node.Name, err)
+		log.Printf("[METRIC][SRC=%s] Gagal membaca body dari %s: %v\n", p.activeParamProfile(), node.Name, err)
 		return
 	}
 
 	var metrics NodeMetrics
 	if err := json.Unmarshal(body, &metrics); err != nil {
-		log.Printf("[METRIC] Gagal parse JSON dari %s: %v\n", node.Name, err)
+		log.Printf("[METRIC][SRC=%s] Gagal parse JSON dari %s: %v\n", p.activeParamProfile(), node.Name, err)
 		return
 	}
 
-	node.CPUUsage = metrics.CPUUsage
+	normalizedCPU := metrics.CPUUsage
+	if metrics.CPUUsageNormalized > 0 || metrics.CPUUsage == 0 {
+		normalizedCPU = metrics.CPUUsageNormalized
+	}
+	if normalizedCPU < 0 {
+		normalizedCPU = 0
+	}
+	if normalizedCPU > 100 {
+		normalizedCPU = 100
+	}
+
+	rawCPU := metrics.CPUUsageRaw
+	if rawCPU <= 0 && metrics.CPUCapacity > 0 {
+		rawCPU = normalizedCPU * (metrics.CPUCapacity / 100.0)
+	}
+
+	node.CPUUsage = normalizedCPU
+	node.CPURawUsage = rawCPU
 	node.LoadAverage = metrics.LoadAverage1
 	node.InflightReq = metrics.InflightRequests
 	node.MemoryUsage = metrics.MemoryUsage
@@ -312,10 +350,21 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 		node.CPUCapacity = 100
 	}
 
-	cpuGauge.WithLabelValues(node.Name).Set(metrics.CPUUsage)
+	cpuGauge.WithLabelValues(node.Name).Set(normalizedCPU)
+	cpuRawGauge.WithLabelValues(node.Name).Set(rawCPU)
 	latencyGauge.WithLabelValues(node.Name).Set(node.ResponseTime)
 
-	log.Printf("[METRIC] Node %s: CPU=%.2f%%/%.0f%%, Load=%.2f, Inflight=%.2f, Latency=%.2fms\n", node.Name, node.CPUUsage, node.CPUCapacity, node.LoadAverage, node.InflightReq, node.ResponseTime)
+	log.Printf(
+		"[METRIC][SRC=%s] Node %s: CPU(norm)=%.2f%%, CPU(raw)=%.2f%%, Cap=%.0f%%, Load=%.2f, Inflight=%.2f, Latency=%.2fms\n",
+		p.activeParamProfile(),
+		node.Name,
+		node.CPUUsage,
+		rawCPU,
+		node.CPUCapacity,
+		node.LoadAverage,
+		node.InflightReq,
+		node.ResponseTime,
+	)
 }
 
 func (p *NodePool) updateAllMetrics() {
@@ -331,14 +380,14 @@ func (p *NodePool) updateAllMetrics() {
 }
 
 func (p *NodePool) startMetricsCollector(interval time.Duration) {
-	log.Printf("[METRIC-COLLECTOR] Memulai kolektor metrik (setiap %s)\n", interval)
+	log.Printf("[METRIC-COLLECTOR][SRC=%s] Memulai kolektor metrik (setiap %s)\n", p.activeParamProfile(), interval)
 	p.updateAllMetrics()
 
 	go func() {
 		ticker := time.NewTicker(interval)
 		for range ticker.C {
 			log.Println()
-			log.Println("[METRIC-COLLECTOR] Memulai pengambilan metrik periodik...")
+			log.Printf("[METRIC-COLLECTOR][SRC=%s] Memulai pengambilan metrik periodik...\n", p.activeParamProfile())
 			p.updateAllMetrics()
 		}
 	}()
@@ -363,7 +412,7 @@ func (p *NodePool) selectBackend_RoundRobin() *Node {
 		node.mutex.RUnlock()
 		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=0.0000] ", node.Name, cpu, queue, lat)
 	}
-	log.Printf("[DECISION] %s==> TERPILIH: %s\n", detailLog, selectedNode.Name)
+	log.Printf("[DECISION][SRC=%s] %s==> TERPILIH: %s\n", p.activeParamProfile(), detailLog, selectedNode.Name)
 	return selectedNode
 }
 
@@ -393,7 +442,7 @@ func (p *NodePool) selectBackend_Fuzzy_Static() *Node {
 		}
 	}
 	if bestNode != nil {
-		log.Printf("[DECISION] %s ==> TERPILIH (FUZZY): %s\n", detailLog, bestNode.Name)
+		log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (FUZZY): %s\n", p.activeParamProfile(), detailLog, bestNode.Name)
 	}
 	return bestNode
 }
@@ -424,7 +473,7 @@ func (p *NodePool) selectBackend_FPSO_Adaptive() *Node {
 		}
 	}
 	if bestNode != nil {
-		log.Printf("[DECISION] %s ==> TERPILIH (F-PSO): %s\n", detailLog, bestNode.Name)
+		log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (F-PSO): %s\n", p.activeParamProfile(), detailLog, bestNode.Name)
 	}
 	return bestNode
 }
@@ -455,7 +504,7 @@ func (p *NodePool) selectBackend_FMOPSO_Adaptive() *Node {
 		}
 	}
 	if bestNode != nil {
-		log.Printf("[DECISION] %s ==> TERPILIH (F-MOPSO): %s\n", detailLog, bestNode.Name)
+		log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (F-MOPSO): %s\n", p.activeParamProfile(), detailLog, bestNode.Name)
 	}
 	return bestNode
 }
@@ -558,14 +607,14 @@ func (p *NodePool) startMOPSOOptimizer(interval time.Duration) {
 			snapshot := mopso.HistoricalSnapshot{
 				OSIdleCPU10: osIdleCPU10,
 				Node1: mopso.NodeState{
-					CPUUsage:     n1.CPUUsage,
+					CPUUsage:     n1.CPURawUsage,
 					CPUCapacity:  n1.CPUCapacity,
 					QueueLength:  nodeQueueSignal(&n1),
 					ResponseTime: n1.ResponseTime,
 					Requests:     r1,
 				},
 				Node2: mopso.NodeState{
-					CPUUsage:     n2.CPUUsage,
+					CPUUsage:     n2.CPURawUsage,
 					CPUCapacity:  n2.CPUCapacity,
 					QueueLength:  nodeQueueSignal(&n2),
 					ResponseTime: n2.ResponseTime,
@@ -618,7 +667,24 @@ func (p *NodePool) startMOPSOOptimizer(interval time.Duration) {
 				p.logMOPSO("[MOPSO] Gagal menyimpan Pareto archive: %v", err)
 			}
 
-			p.logMOPSO("[FACT] Total Request=%d, Pembagian=[%s:%d, %s:%d], CPU Aktual=[%s:%.2f%%, %s:%.2f%%]", totalReq, n1.Name, r1, n2.Name, r2, n1.Name, n1.CPUUsage, n2.Name, n2.CPUUsage)
+			p.logMOPSO(
+				"[FACT] Total Request=%d, Pembagian=[%s:%d, %s:%d], CPU Aktual Norm=[%s:%.2f%%, %s:%.2f%%], Raw=[%s:%.2f%%/cap%.0f%%, %s:%.2f%%/cap%.0f%%]",
+				totalReq,
+				n1.Name,
+				r1,
+				n2.Name,
+				r2,
+				n1.Name,
+				n1.CPUUsage,
+				n2.Name,
+				n2.CPUUsage,
+				n1.Name,
+				n1.CPURawUsage,
+				n1.CPUCapacity,
+				n2.Name,
+				n2.CPURawUsage,
+				n2.CPUCapacity,
+			)
 			p.logMOPSO("[MATH] CostPerReq=(ActualCPU-Idle10)/max(req,1) => [%s:%.8f, %s:%.8f]", n1.Name, result.CostPerReq1, n2.Name, result.CostPerReq2)
 			p.logMOPSO("[MOPSO] ParetoSolutions=%d, ActiveMode=%s, ActiveProfile=%s, ActiveObjectives=(f1=%.6f,f2=%.6f)", len(result.Archive), p.mopsoMode, active.Mode, active.Solution.Objective.Imbalance, active.Solution.Objective.PeakLoad)
 		}
@@ -632,6 +698,22 @@ func (p *NodePool) logMOPSO(format string, args ...any) {
 	p.mopsoLogMu.Lock()
 	defer p.mopsoLogMu.Unlock()
 	p.mopsoLog.Printf(format, args...)
+}
+
+func (p *NodePool) nodeNameByHost(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "unknown-node"
+	}
+	for _, n := range p.nodes {
+		if n == nil || n.URL == nil {
+			continue
+		}
+		if strings.EqualFold(n.URL.Host, host) {
+			return n.Name
+		}
+	}
+	return "unknown-node"
 }
 
 func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
@@ -655,13 +737,60 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 			}
 
 			backendNode.RequestCount.Add(1)
+			originalHost := req.Host
 			req.URL.Scheme = backendNode.URL.Scheme
 			req.URL.Host = backendNode.URL.Host
-			req.Host = backendNode.URL.Host
+			req.Header.Set(selectedNodeTraceHeader, backendNode.Name)
+			req.Header.Set("X-Forwarded-Host", originalHost)
+			req.Host = originalHost
 		},
-		ModifyResponse: func(res *http.Response) error { return nil },
+		ModifyResponse: func(res *http.Response) error {
+			if res == nil || res.Request == nil || res.Request.URL == nil {
+				return nil
+			}
+			selectedNode := strings.TrimSpace(res.Request.Header.Get(selectedNodeTraceHeader))
+			if selectedNode == "" {
+				selectedNode = pool.nodeNameByHost(res.Request.URL.Host)
+			}
+			path := res.Request.URL.Path
+			if res.Request.URL.RawQuery != "" {
+				path += "?" + res.Request.URL.RawQuery
+			}
+			log.Printf(
+				"[PROXY-TRACE] Node: %s | Method: %s | Path: %s | Status: %d %s",
+				selectedNode,
+				res.Request.Method,
+				path,
+				res.StatusCode,
+				http.StatusText(res.StatusCode),
+			)
+			pool.recordPerHitBySelectedNode(selectedNode)
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("Gagal meneruskan request ke backend: %v\n", err)
+			selectedNode := strings.TrimSpace(r.Header.Get(selectedNodeTraceHeader))
+			if selectedNode == "" && r.URL != nil {
+				selectedNode = pool.nodeNameByHost(r.URL.Host)
+			}
+			targetHost := "unknown-host"
+			path := ""
+			if r.URL != nil {
+				if strings.TrimSpace(r.URL.Host) != "" {
+					targetHost = r.URL.Host
+				}
+				path = r.URL.Path
+				if r.URL.RawQuery != "" {
+					path += "?" + r.URL.RawQuery
+				}
+			}
+			log.Printf(
+				"[PROXY-ERROR] Node: %s | TargetHost: %s | Method: %s | Path: %s | Error: %v",
+				selectedNode,
+				targetHost,
+				r.Method,
+				path,
+				err,
+			)
 			http.Error(w, "Service tidak tersedia", http.StatusServiceUnavailable)
 		},
 	}
@@ -670,7 +799,11 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 
 var (
 	cpuGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{Name: "pso_node_cpu_usage", Help: "Penggunaan CPU node backend (%)"},
+		prometheus.GaugeOpts{Name: "pso_node_cpu_usage", Help: "Penggunaan CPU node backend ternormalisasi kapasitas (%)"},
+		[]string{"node_name"},
+	)
+	cpuRawGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{Name: "pso_node_cpu_usage_raw", Help: "Penggunaan CPU node backend absolut sebelum normalisasi (%)"},
 		[]string{"node_name"},
 	)
 	latencyGauge = prometheus.NewGaugeVec(
@@ -696,6 +829,7 @@ var (
 
 func init() {
 	prometheus.MustRegister(cpuGauge)
+	prometheus.MustRegister(cpuRawGauge)
 	prometheus.MustRegister(latencyGauge)
 	prometheus.MustRegister(mopsoCostPerRequestGauge)
 	prometheus.MustRegister(mopsoActiveModeGauge)
@@ -726,6 +860,24 @@ func envDurationMS(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
+func previewParams(params []float64, n int) string {
+	if len(params) == 0 {
+		return "[]"
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > len(params) {
+		n = len(params)
+	}
+	if len(params) <= 2*n {
+		return fmt.Sprintf("%v", params)
+	}
+	head := params[:n]
+	tail := params[len(params)-n:]
+	return fmt.Sprintf("head=%v tail=%v", head, tail)
+}
+
 func main() {
 	ensureDirs("configs", "storage", "logs")
 
@@ -751,7 +903,25 @@ func main() {
 	baseParams := loadFloatArrayWithFallback(baseFuzzyParamsPath, DefaultBaseFuzzyParams, "base fuzzy params")
 	baseParams = sanitizeFuzzyParams(baseParams)
 
-	StaticFuzzyEngine = fuzzy.NewEngine(baseParams)
+	paramSource := envLower("FUZZY_PARAM_SOURCE", "base")
+	paramProfile := "BASE"
+	activeParamFile := baseFuzzyParamsPath
+	staticParams := append([]float64(nil), baseParams...)
+	switch paramSource {
+	case "optimized":
+		staticParams = loadFloatArrayWithFallback(optimizedFuzzyPath, baseParams, "parameter fuzzy teroptimasi")
+		paramProfile = "OPTIMIZED"
+		activeParamFile = optimizedFuzzyPath
+		log.Printf("[FUZZY] FUZZY_PARAM_SOURCE=optimized, menggunakan %s (fallback base)", optimizedFuzzyPath)
+	case "base":
+		log.Printf("[FUZZY] FUZZY_PARAM_SOURCE=base, menggunakan base params")
+	default:
+		log.Printf("[WARNING] FUZZY_PARAM_SOURCE=%s tidak dikenal, fallback ke base", paramSource)
+	}
+	staticParams = sanitizeFuzzyParams(staticParams)
+	log.Printf("[ENTRYPOINT][PARAM-SOURCE] PROFILE=%s FUZZY_PARAM_SOURCE=%s ACTIVE_FILE=%s", paramProfile, paramSource, activeParamFile)
+	log.Printf("[ENTRYPOINT][PARAM-SNAPSHOT] LEN=%d %s", len(staticParams), previewParams(staticParams, 3))
+	StaticFuzzyEngine = fuzzy.NewEngine(staticParams)
 	activeFMOPSOParams := loadFloatArrayWithFallback(fmopsoParamsPath, baseParams, "parameter adaptif F-MOPSO")
 	activeFMOPSOParams = sanitizeFuzzyParams(activeFMOPSOParams)
 	AdaptiveFMOPSOEngine = fuzzy.NewEngine(activeFMOPSOParams)
@@ -764,9 +934,17 @@ func main() {
 	metricsClient := &http.Client{Timeout: 500 * time.Millisecond}
 
 	pool := &NodePool{
-		client:    metricsClient,
-		algorithm: envLower("LB_ALGO", "fuzzy"),
-		mopsoMode: envLower("MOPSO_BUSINESS_MODE", "balanced"),
+		client:       metricsClient,
+		algorithm:    envLower("LB_ALGO", "fuzzy"),
+		mopsoMode:    envLower("MOPSO_BUSINESS_MODE", "balanced"),
+		paramProfile: paramProfile,
+	}
+	pool.trafficLogMode = envLower("TRAFFIC_LOG_MODE", trafficLogModeWindow)
+	switch pool.trafficLogMode {
+	case trafficLogModeWindow, trafficLogModePerHit:
+	default:
+		log.Printf("[WARNING] TRAFFIC_LOG_MODE=%s tidak dikenal, fallback ke %s", pool.trafficLogMode, trafficLogModeWindow)
+		pool.trafficLogMode = trafficLogModeWindow
 	}
 	switch pool.algorithm {
 	case "roundrobin", "fuzzy", "fmopso":
@@ -794,8 +972,16 @@ func main() {
 	switch pool.algorithm {
 	case "fmopso":
 		pool.startMOPSOOptimizer(optimizerInterval)
-	case "fuzzy", "roundrobin":
-		log.Printf("[OPTIMIZER] Mode %s aktif, worker optimizer dilewati", pool.algorithm)
+	case "fuzzy":
+		if pool.trafficLogMode == trafficLogModePerHit {
+			log.Printf("[DATASET] Mode fuzzy aktif dengan TRAFFIC_LOG_MODE=%s (recorder per-hit via response hook)", pool.trafficLogMode)
+		} else {
+			pool.startFuzzyDatasetRecorder(optimizerInterval)
+			log.Printf("[DATASET] Mode fuzzy aktif dengan TRAFFIC_LOG_MODE=%s (recorder window=%s)", pool.trafficLogMode, optimizerInterval)
+		}
+		log.Printf("[OPTIMIZER] Mode fuzzy aktif, worker optimizer dilewati")
+	case "roundrobin":
+		log.Printf("[OPTIMIZER] Mode roundrobin aktif, worker optimizer dilewati")
 	default:
 		log.Printf("[OPTIMIZER] ALGO=%s tidak didukung optimizer, worker dilewati", pool.algorithm)
 	}
@@ -812,7 +998,7 @@ func main() {
 		proxy.ServeHTTP(w, r)
 	})
 
-	log.Printf("Memulai Load Balancer di port :8080 (ALGO=%s, MOPSO_MODE=%s, METRICS_INTERVAL=%s, OPT_INTERVAL=%s)...", pool.algorithm, pool.mopsoMode, metricsInterval, optimizerInterval)
+	log.Printf("Memulai Load Balancer di port :8080 (ALGO=%s, PARAM_PROFILE=%s, MOPSO_MODE=%s, TRAFFIC_LOG_MODE=%s, METRICS_INTERVAL=%s, OPT_INTERVAL=%s)...", pool.algorithm, pool.activeParamProfile(), pool.mopsoMode, pool.trafficLogMode, metricsInterval, optimizerInterval)
 	server := &http.Server{
 		Addr:         ":8080",
 		Handler:      mux,

@@ -27,6 +27,7 @@ var hostName string
 var myProcess *process.Process
 var (
 	cachedCPU          float64
+	cachedCPURaw       float64
 	cpuMutex           sync.RWMutex
 	cpuHistory         []float64
 	cpuLimitPercent    = 100.0
@@ -94,8 +95,12 @@ func startCPUMonitor() {
 			if scaledVal > 100.0 {
 				scaledVal = 100.0
 			}
+			if scaledVal < 0 {
+				scaledVal = 0
+			}
 
 			cpuMutex.Lock()
+			cachedCPURaw = val
 			cpuHistory = append(cpuHistory, scaledVal)
 			if len(cpuHistory) > windowSize {
 				cpuHistory = cpuHistory[1:]
@@ -118,13 +123,15 @@ type ResponseData struct {
 }
 
 type NodeMetrics struct {
-	NodeName         string  `json:"node_name"`
-	CPUUsage         float64 `json:"cpu_usage"`
-	MemoryUsage      float64 `json:"memory_usage"`
-	LoadAverage1     float64 `json:"load_average_1"`
-	RequestLatencyMS float64 `json:"request_latency_ms"`
-	InflightRequests float64 `json:"inflight_requests"`
-	CPUCapacity      float64 `json:"cpu_capacity_percent"`
+	NodeName           string  `json:"node_name"`
+	CPUUsage           float64 `json:"cpu_usage"`
+	CPUUsageRaw        float64 `json:"cpu_usage_raw"`
+	CPUUsageNormalized float64 `json:"cpu_usage_normalized"`
+	MemoryUsage        float64 `json:"memory_usage"`
+	LoadAverage1       float64 `json:"load_average_1"`
+	RequestLatencyMS   float64 `json:"request_latency_ms"`
+	InflightRequests   float64 `json:"inflight_requests"`
+	CPUCapacity        float64 `json:"cpu_capacity_percent"`
 }
 
 func loadRequestLatencyEWMA() float64 {
@@ -149,11 +156,13 @@ func updateRequestLatencyEWMA(sampleMS float64) {
 
 func metricsJSONHandler(w http.ResponseWriter, r *http.Request, name string) {
 	var cpuUsage float64
+	var cpuUsageRaw float64
 	var memUsage float32
 
 	if myProcess != nil {
 		cpuMutex.RLock()
 		cpuUsage = cachedCPU
+		cpuUsageRaw = cachedCPURaw
 		cpuMutex.RUnlock()
 
 		memVal, err := myProcess.MemoryPercent()
@@ -169,13 +178,15 @@ func metricsJSONHandler(w http.ResponseWriter, r *http.Request, name string) {
 	}
 
 	metrics := NodeMetrics{
-		NodeName:         name,
-		CPUUsage:         cpuUsage,
-		MemoryUsage:      float64(memUsage),
-		LoadAverage1:     loadAvg1,
-		RequestLatencyMS: loadRequestLatencyEWMA(),
-		InflightRequests: float64(inflightRequests.Load()),
-		CPUCapacity:      cpuLimitPercent,
+		NodeName:           name,
+		CPUUsage:           cpuUsage,
+		CPUUsageRaw:        cpuUsageRaw,
+		CPUUsageNormalized: cpuUsage,
+		MemoryUsage:        float64(memUsage),
+		LoadAverage1:       loadAvg1,
+		RequestLatencyMS:   loadRequestLatencyEWMA(),
+		InflightRequests:   float64(inflightRequests.Load()),
+		CPUCapacity:        cpuLimitPercent,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -345,6 +356,22 @@ func withPrometheus(next http.Handler) http.Handler {
 		labels := []string{hostName, nodeName, r.Method, r.URL.Path, statusStr}
 		apiRequestTotal.WithLabelValues(labels...).Inc()
 		apiRequestDuration.WithLabelValues(labels...).Observe(durationSeconds)
+		fullPath := r.URL.Path
+		if r.URL.RawQuery != "" {
+			fullPath += "?" + r.URL.RawQuery
+		}
+		log.Printf(
+			"[API-ACCESS] backend=%s node=%s method=%s path=%s host=%s status=%d duration_ms=%.2f remote=%s ua=%q",
+			hostName,
+			nodeName,
+			r.Method,
+			fullPath,
+			r.Host,
+			rec.status,
+			durationMS,
+			r.RemoteAddr,
+			r.UserAgent(),
+		)
 
 		// Endpoint metrik tidak dipakai sebagai sinyal latency bisnis.
 		if r.URL.Path != "/metrics" && r.URL.Path != "/metrics/prometheus" {
@@ -371,6 +398,10 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
 		data := ResponseData{
 			Message:   fmt.Sprintf("Request %s berhasil ditangani", r.Method),
 			NodeName:  nodeName,
@@ -391,7 +422,9 @@ func main() {
 	mux.Handle("/metrics/prometheus", promhttp.Handler())
 
 	mux.HandleFunc("/process", dataProcessHandler)
+	mux.HandleFunc("/write", dataProcessHandler)
 	mux.HandleFunc("/fetch", dataFetchHandler)
+	mux.HandleFunc("/read", dataFetchHandler)
 	mux.HandleFunc("/api/stress-test", stressTestHandler)
 
 	handler := chain(mux, withBackendHeader, withPrometheus)

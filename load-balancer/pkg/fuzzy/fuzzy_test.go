@@ -2,6 +2,7 @@ package fuzzy
 
 import (
 	"fmt"
+	"math"
 	"testing"
 )
 
@@ -45,5 +46,47 @@ func TestFuzzyLogic(t *testing.T) {
 			tc.metrics.CPU, tc.metrics.QueueLength, tc.metrics.RespTime)
 		fmt.Printf("  -> Output : Skor Kelayakan: %.4f\n", score)
 		fmt.Println("------------------------------------------")
+	}
+}
+
+func TestFuzzifyShoulderMembership(t *testing.T) {
+	tests := []struct {
+		name string
+		val  float64
+		mf   Triple
+		want float64
+	}{
+		{
+			name: "left_shoulder_at_zero_should_be_one",
+			val:  0,
+			mf:   Triple{0, 0, 50},
+			want: 1.0,
+		},
+		{
+			name: "left_shoulder_mid",
+			val:  25,
+			mf:   Triple{0, 0, 50},
+			want: 0.5,
+		},
+		{
+			name: "right_shoulder_high_should_be_one",
+			val:  100,
+			mf:   Triple{50, 100, 100},
+			want: 1.0,
+		},
+		{
+			name: "right_shoulder_ramp",
+			val:  75,
+			mf:   Triple{50, 100, 100},
+			want: 0.5,
+		},
+	}
+
+	const eps = 1e-9
+	for _, tt := range tests {
+		got := Fuzzify(tt.val, tt.mf)
+		if math.Abs(got-tt.want) > eps {
+			t.Fatalf("%s: got %.10f want %.10f", tt.name, got, tt.want)
+		}
 	}
 }

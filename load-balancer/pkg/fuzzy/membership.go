@@ -1,6 +1,38 @@
 package fuzzy
 
 func Fuzzify(val float64, mf Triple) float64 {
+	// Left shoulder: A == B, contoh "Rendah" pada (0,0,50).
+	// Nilai di sisi kiri harus aktif penuh (1), lalu turun linier ke 0 di C.
+	if mf.A == mf.B {
+		if val <= mf.B {
+			return 1.0
+		}
+		if val >= mf.C {
+			return 0.0
+		}
+		den := mf.C - mf.B
+		if den == 0 {
+			return 0
+		}
+		return (mf.C - val) / den
+	}
+
+	// Right shoulder: B == C, contoh "Tinggi" pada (50,100,100).
+	// Nilai di sisi kanan harus aktif penuh (1), naik linier dari A ke B.
+	if mf.B == mf.C {
+		if val >= mf.B {
+			return 1.0
+		}
+		if val <= mf.A {
+			return 0.0
+		}
+		den := mf.B - mf.A
+		if den == 0 {
+			return 0
+		}
+		return (val - mf.A) / den
+	}
+
 	if val == mf.B {
 		return 1.0
 	}
