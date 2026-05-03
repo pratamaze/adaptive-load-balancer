@@ -20,12 +20,22 @@ func NewEngine(initialParams []float64) *Engine {
 
 // UpdateParams dipanggil oleh optimizer (PSO/MOPSO) untuk memperbarui parameter.
 func (e *Engine) UpdateParams(newParams []float64) {
+	const alpha = 0.3
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
 	if len(e.params) != len(newParams) {
 		e.params = make([]float64, len(newParams))
+		copy(e.params, newParams)
+		return
 	}
-	copy(e.params, newParams)
+
+	// EMA smoothing mencegah osilasi agresif saat parameter hot-reload.
+	// p_t = alpha * p_baru + (1-alpha) * p_lama
+	for i := range newParams {
+		e.params[i] = (alpha * newParams[i]) + ((1 - alpha) * e.params[i])
+	}
 }
 
 // GetParams mengembalikan snapshot parameter saat ini.

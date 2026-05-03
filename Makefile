@@ -25,6 +25,8 @@ LB_SERVICE ?= fmopso-stack_entry-point
 NODE1_SERVICE ?= fmopso-stack_api-node1
 NODE2_SERVICE ?= fmopso-stack_api-node2
 LB_MODE_LABEL_KEY ?= fmopso.mode
+LB_PUBLIC_SCHEME ?= http
+LB_PUBLIC_PORT ?= 80
 
 MOPSO_PARTICLES ?= 50
 MOPSO_ITERATIONS ?= 3000
@@ -40,7 +42,7 @@ SSH_OPTS := -i $(SSH_KEY) -p $(SSH_PORT)
 SCP_OPTS := -i $(SSH_KEY) -P $(SSH_PORT)
 REMOTE_ADDR := $(REMOTE_USER)@$(REMOTE_HOST)
 
-.PHONY: help dataset-pull dataset-capture-live train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source
+.PHONY: help dataset-pull dataset-capture-live train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source show-lb-runtime verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source
 
 help:
 	@echo "Available targets:"
@@ -53,6 +55,7 @@ help:
 	@echo "  make dataset-reset-local"
 	@echo "  make dataset-reset-remote"
 	@echo "  make prep-fmopso-realtime # Aktifkan FMOPSO realtime (adaptive optimizer live)"
+	@echo "  make show-lb-runtime   # Cek runtime status via HTTP /lb/runtime"
 	@echo "  make logs-lb-source    # Tampilkan marker source parameter dari log entrypoint"
 
 dataset-pull:
@@ -124,17 +127,17 @@ reset-swarm:
 	@echo "Swarm services have been force-updated and stabilized."
 
 prep-fuzzy:
-	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm FUZZY_PARAM_SOURCE --env-rm TRAFFIC_LOG_MODE --env-add FUZZY_PARAM_SOURCE=base --env-add TRAFFIC_LOG_MODE=per_hit --label-add $(LB_MODE_LABEL_KEY)=fuzzy-base $(LB_SERVICE)"
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGO --env-add LB_ALGO=fuzzy --env-rm FUZZY_PARAM_SOURCE --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --env-add FUZZY_PARAM_SOURCE=base --env-add TRAFFIC_LOG_MODE=per_hit --label-add $(LB_MODE_LABEL_KEY)=fuzzy-base $(LB_SERVICE)"
 	@$(MAKE) reset-swarm
 	@$(MAKE) verify-fuzzy
 
 prep-mopso:
-	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=optimized --env-rm TRAFFIC_LOG_MODE --label-add $(LB_MODE_LABEL_KEY)=mopso-optimized $(LB_SERVICE)"
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGO --env-add LB_ALGO=fuzzy --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=optimized --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --label-add $(LB_MODE_LABEL_KEY)=mopso-optimized $(LB_SERVICE)"
 	@$(MAKE) reset-swarm
 	@$(MAKE) verify-mopso
 
 prep-fmopso-realtime:
-	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGO --env-add LB_ALGO=fmopso --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=base --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --label-add $(LB_MODE_LABEL_KEY)=fmopso-realtime $(LB_SERVICE)"
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGO --env-add LB_ALGO=fmopso --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=base --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --label-add $(LB_MODE_LABEL_KEY)=fmopso-realtime $(LB_SERVICE)"
 	@$(MAKE) reset-swarm
 	@$(MAKE) verify-fmopso-realtime
 
@@ -142,7 +145,7 @@ show-lb-source:
 	@echo "=== LB Service Spec ($(LB_SERVICE)) ==="
 	ssh $(SSH_OPTS) $(REMOTE_ADDR) '\
 		echo "[ENV:SERVICE_SPEC]"; \
-		docker service inspect $(LB_SERVICE) --format "{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}" | grep -E "^(FUZZY_PARAM_SOURCE|TRAFFIC_LOG_MODE)=" || true; \
+		docker service inspect $(LB_SERVICE) --format "{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}" | grep -E "^(LB_ALGO|FUZZY_PARAM_SOURCE|TRAFFIC_LOG_MODE|MOPSO_BUSINESS_MODE|METRICS_INTERVAL|OPTIMIZER_INTERVAL|ALGO_STATUS_LOG_INTERVAL)=" || true; \
 		echo "[LABEL:SERVICE_SPEC]"; \
 		docker service inspect $(LB_SERVICE) --format "{{json .Spec.Labels}}"'
 	@echo "=== LB Running Task (Actual Container) ==="
@@ -151,7 +154,11 @@ show-lb-source:
 		if [ -z "$$cid" ]; then echo "LB container belum running"; exit 1; fi; \
 		echo CONTAINER_ID=$$cid; \
 		echo "[ENV:CONTAINER_RUNTIME]"; \
-		docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -E "^(FUZZY_PARAM_SOURCE|TRAFFIC_LOG_MODE)=" || true'
+		docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -E "^(LB_ALGO|FUZZY_PARAM_SOURCE|TRAFFIC_LOG_MODE|MOPSO_BUSINESS_MODE|METRICS_INTERVAL|OPTIMIZER_INTERVAL|ALGO_STATUS_LOG_INTERVAL)=" || true'
+
+show-lb-runtime:
+	@echo "=== LB Runtime API ($(LB_PUBLIC_SCHEME)://$(REMOTE_HOST):$(LB_PUBLIC_PORT)/lb/runtime) ==="
+	curl -fsS "$(LB_PUBLIC_SCHEME)://$(REMOTE_HOST):$(LB_PUBLIC_PORT)/lb/runtime"
 
 verify-fuzzy:
 	@echo "Verifying FUZZY baseline mode..."
@@ -160,6 +167,7 @@ verify-fuzzy:
 			cid=$$(docker ps --filter label=com.docker.swarm.service.name=$(LB_SERVICE) --format "{{.ID}}" | head -n1); \
 			if [ -n "$$cid" ] && \
 			   docker service inspect $(LB_SERVICE) --format "{{json .Spec.Labels}}" | grep -q "\"$(LB_MODE_LABEL_KEY)\":\"fuzzy-base\"" && \
+			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^LB_ALGO=fuzzy$$" && \
 			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^FUZZY_PARAM_SOURCE=base$$" && \
 			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^TRAFFIC_LOG_MODE=per_hit$$"; then \
 				echo "OK: source=fuzzy-base, logging=per_hit"; \
@@ -178,6 +186,7 @@ verify-mopso:
 			cid=$$(docker ps --filter label=com.docker.swarm.service.name=$(LB_SERVICE) --format "{{.ID}}" | head -n1); \
 			if [ -n "$$cid" ] && \
 			   docker service inspect $(LB_SERVICE) --format "{{json .Spec.Labels}}" | grep -q "\"$(LB_MODE_LABEL_KEY)\":\"mopso-optimized\"" && \
+			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^LB_ALGO=fuzzy$$" && \
 			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^FUZZY_PARAM_SOURCE=optimized$$" && \
 			   ! docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^TRAFFIC_LOG_MODE="; then \
 				echo "OK: source=mopso-optimized, logging=off"; \
@@ -210,4 +219,4 @@ verify-fmopso-realtime:
 logs-lb-source:
 	@echo "=== LB Source Markers From Service Logs ($(LB_SERVICE)) ==="
 	ssh $(SSH_OPTS) $(REMOTE_ADDR) '\
-		docker service logs --raw --timestamps --since 20m --tail 400 $(LB_SERVICE) 2>&1 | grep -E "ENTRYPOINT\\]\\[PARAM-SOURCE|ENTRYPOINT\\]\\[PARAM-SNAPSHOT|\\[FUZZY\\]" || true'
+		docker service logs --raw --timestamps --since 20m --tail 400 $(LB_SERVICE) 2>&1 | grep -E "ENTRYPOINT\\]\\[PARAM-SOURCE|ENTRYPOINT\\]\\[PARAM-SNAPSHOT|\\[FUZZY\\]|\\[RUNTIME\\]\\[ALGO-STATUS\\]|Memulai Load Balancer" || true'

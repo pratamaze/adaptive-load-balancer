@@ -241,6 +241,7 @@ func OptimizeReplay(baseParams []float64, snap HistoricalSnapshot) ParetoResult 
 				r1 := rng.Float64()
 				r2 := rng.Float64()
 				v := w*p.v[d] + cognitiveC1*r1*(p.pbest[d]-p.x[d]) + socialC2*r2*(leader.Params[d]-p.x[d])
+				v = clampVelocity(v, d)
 				x := p.x[d] + v
 				p.v[d] = v
 				p.x[d] = clamp(x, lowerBound(d), upperBound(d))
@@ -413,6 +414,21 @@ func clamp(v, lo, hi float64) float64 {
 		return hi
 	}
 	return v
+}
+
+func clampVelocity(v float64, d int) float64 {
+	vmax := maxVelocity(d)
+	return clamp(v, -vmax, vmax)
+}
+
+func maxVelocity(d int) float64 {
+	// Batas kecepatan 10% rentang domain tiap dimensi
+	// agar pergerakan partikel tetap stabil dan tidak eksplosif.
+	span := upperBound(d) - lowerBound(d)
+	if span <= 0 {
+		return 1
+	}
+	return 0.10 * span
 }
 
 func maxInt64(a, b int64) int64 {

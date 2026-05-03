@@ -120,6 +120,8 @@ type NodePool struct {
 	mopsoMode      string
 	paramProfile   string
 	trafficLogMode string
+	metricsEvery   time.Duration
+	optimizerEvery time.Duration
 }
 
 /*
@@ -134,6 +136,7 @@ type RuntimeConfig struct {
 	TrafficLogMode    string
 	MetricsInterval   time.Duration
 	OptimizerInterval time.Duration
+	AlgoLogInterval   time.Duration
 	BackendDNS        []string
 }
 
@@ -919,6 +922,7 @@ func loadRuntimeConfig() RuntimeConfig {
 		TrafficLogMode:    trafficLogMode,
 		MetricsInterval:   envDurationMS("METRICS_INTERVAL", 200*time.Millisecond),
 		OptimizerInterval: envDurationMS("OPTIMIZER_INTERVAL", 1*time.Second),
+		AlgoLogInterval:   envDurationMS("ALGO_STATUS_LOG_INTERVAL", 30*time.Second),
 		BackendDNS:        []string{"http://api-node1:8080", "http://api-node2:8080"},
 	}
 }
@@ -972,7 +976,50 @@ func newNodePool(client *http.Client, cfg RuntimeConfig, paramProfile string) *N
 		mopsoMode:      cfg.MOPSOMode,
 		paramProfile:   paramProfile,
 		trafficLogMode: cfg.TrafficLogMode,
+		metricsEvery:   cfg.MetricsInterval,
+		optimizerEvery: cfg.OptimizerInterval,
 	}
+}
+
+func (p *NodePool) runtimeStatus() map[string]any {
+	return map[string]any{
+		"algorithm":          p.algorithm,
+		"param_profile":      p.activeParamProfile(),
+		"mopso_mode":         p.mopsoMode,
+		"traffic_log_mode":   p.trafficLogMode,
+		"metrics_interval":   p.metricsEvery.String(),
+		"optimizer_interval": p.optimizerEvery.String(),
+		"timestamp_utc":      time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+func (p *NodePool) statusHTTPHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Gunakan method GET", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(p.runtimeStatus())
+}
+
+func (p *NodePool) startAlgoStatusLogger(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			log.Printf(
+				"[RUNTIME][ALGO-STATUS] ALGO=%s PARAM_PROFILE=%s MOPSO_MODE=%s TRAFFIC_LOG_MODE=%s METRICS_INTERVAL=%s OPT_INTERVAL=%s",
+				p.algorithm,
+				p.activeParamProfile(),
+				p.mopsoMode,
+				p.trafficLogMode,
+				p.metricsEvery,
+				p.optimizerEvery,
+			)
+		}
+	}()
 }
 
 // registerBackendNodes mendaftarkan backend statis ke pool.
@@ -991,6 +1038,7 @@ func registerBackendNodes(pool *NodePool, backendDNS []string) error {
 // startRuntimeWorkers menyalakan worker periodik sesuai mode algoritma aktif.
 func startRuntimeWorkers(pool *NodePool, cfg RuntimeConfig) {
 	pool.startMetricsCollector(cfg.MetricsInterval)
+	pool.startAlgoStatusLogger(cfg.AlgoLogInterval)
 	switch pool.algorithm {
 	case "fmopso":
 		pool.startMOPSOOptimizer(cfg.OptimizerInterval)
@@ -1007,10 +1055,15 @@ func startRuntimeWorkers(pool *NodePool, cfg RuntimeConfig) {
 func newHTTPMux(pool *NodePool) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/lb/runtime", pool.statusHTTPHandler)
 	proxy := newReverseProxy(pool)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/metrics" {
 			promhttp.Handler().ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/lb/runtime" {
+			pool.statusHTTPHandler(w, r)
 			return
 		}
 		proxy.ServeHTTP(w, r)
