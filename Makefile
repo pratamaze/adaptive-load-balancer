@@ -40,7 +40,7 @@ SSH_OPTS := -i $(SSH_KEY) -p $(SSH_PORT)
 SCP_OPTS := -i $(SSH_KEY) -P $(SSH_PORT)
 REMOTE_ADDR := $(REMOTE_USER)@$(REMOTE_HOST)
 
-.PHONY: help dataset-pull dataset-capture-live train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso show-lb-source verify-fuzzy verify-mopso logs-lb-source
+.PHONY: help dataset-pull dataset-capture-live train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source
 
 help:
 	@echo "Available targets:"
@@ -52,6 +52,7 @@ help:
 	@echo "  make params-pull      # Ambil parameter optimized dari VPS"
 	@echo "  make dataset-reset-local"
 	@echo "  make dataset-reset-remote"
+	@echo "  make prep-fmopso-realtime # Aktifkan FMOPSO realtime (adaptive optimizer live)"
 	@echo "  make logs-lb-source    # Tampilkan marker source parameter dari log entrypoint"
 
 dataset-pull:
@@ -132,6 +133,11 @@ prep-mopso:
 	@$(MAKE) reset-swarm
 	@$(MAKE) verify-mopso
 
+prep-fmopso-realtime:
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGO --env-add LB_ALGO=fmopso --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=base --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --label-add $(LB_MODE_LABEL_KEY)=fmopso-realtime $(LB_SERVICE)"
+	@$(MAKE) reset-swarm
+	@$(MAKE) verify-fmopso-realtime
+
 show-lb-source:
 	@echo "=== LB Service Spec ($(LB_SERVICE)) ==="
 	ssh $(SSH_OPTS) $(REMOTE_ADDR) '\
@@ -180,6 +186,24 @@ verify-mopso:
 			sleep 2; \
 		done; \
 		echo "FAILED: mode mopso belum aktif penuh"; \
+		exit 1'
+	@$(MAKE) show-lb-source
+
+verify-fmopso-realtime:
+	@echo "Verifying FMOPSO realtime mode..."
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) '\
+		for i in $$(seq 1 20); do \
+			cid=$$(docker ps --filter label=com.docker.swarm.service.name=$(LB_SERVICE) --format "{{.ID}}" | head -n1); \
+			if [ -n "$$cid" ] && \
+			   docker service inspect $(LB_SERVICE) --format "{{json .Spec.Labels}}" | grep -q "\"$(LB_MODE_LABEL_KEY)\":\"fmopso-realtime\"" && \
+			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^LB_ALGO=fmopso$$" && \
+			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^MOPSO_BUSINESS_MODE=balanced$$"; then \
+				echo "OK: algo=fmopso (realtime), mode=balanced"; \
+				exit 0; \
+			fi; \
+			sleep 2; \
+		done; \
+		echo "FAILED: mode fmopso realtime belum aktif penuh"; \
 		exit 1'
 	@$(MAKE) show-lb-source
 
