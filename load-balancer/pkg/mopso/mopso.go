@@ -548,6 +548,23 @@ func repairParams(params []float64) {
 	enforcePeakOrder(params, 0, 2.0, 100.0)   // CPU
 	enforcePeakOrder(params, 9, 20.0, 2000.0) // Queue
 	enforcePeakOrder(params, 18, 20.0, 2000.0)
+
+	// Overlap enforcement per variabel linguistik (3 segitiga: Low, Medium, High)
+	// untuk menghindari dead zone antar himpunan.
+	for i := 0; i+8 < len(params); i += 9 {
+		// Gap antara Low.c dan Medium.a
+		if params[i+2] < params[i+3] {
+			mid := (params[i+2] + params[i+3]) / 2
+			params[i+2] = mid
+			params[i+3] = mid
+		}
+		// Gap antara Medium.c dan High.a
+		if params[i+5] < params[i+6] {
+			mid := (params[i+5] + params[i+6]) / 2
+			params[i+5] = mid
+			params[i+6] = mid
+		}
+	}
 }
 
 func enforcePeakOrder(params []float64, start int, minGap, hi float64) {
@@ -603,17 +620,17 @@ func enforcePeakOrder(params []float64, start int, minGap, hi float64) {
 // ---- Fast fuzzy scoring (allocation-free path) ----
 
 func fuzzyScore(params []float64, cpu, q, rt float64) float64 {
-	muCPU0 := fuzzify(cpu, params[0], params[1], params[2])
-	muCPU1 := fuzzify(cpu, params[3], params[4], params[5])
-	muCPU2 := fuzzify(cpu, params[6], params[7], params[8])
+	muCPU0 := fuzzifyLeft(cpu, params[0], params[1], params[2])
+	muCPU1 := fuzzifyTriangle(cpu, params[3], params[4], params[5])
+	muCPU2 := fuzzifyRight(cpu, params[6], params[7], params[8])
 
-	muQ0 := fuzzify(q, params[9], params[10], params[11])
-	muQ1 := fuzzify(q, params[12], params[13], params[14])
-	muQ2 := fuzzify(q, params[15], params[16], params[17])
+	muQ0 := fuzzifyLeft(q, params[9], params[10], params[11])
+	muQ1 := fuzzifyTriangle(q, params[12], params[13], params[14])
+	muQ2 := fuzzifyRight(q, params[15], params[16], params[17])
 
-	muR0 := fuzzify(rt, params[18], params[19], params[20])
-	muR1 := fuzzify(rt, params[21], params[22], params[23])
-	muR2 := fuzzify(rt, params[24], params[25], params[26])
+	muR0 := fuzzifyLeft(rt, params[18], params[19], params[20])
+	muR1 := fuzzifyTriangle(rt, params[21], params[22], params[23])
+	muR2 := fuzzifyRight(rt, params[24], params[25], params[26])
 
 	cpuVals := [3]float64{muCPU0, muCPU1, muCPU2}
 	qVals := [3]float64{muQ0, muQ1, muQ2}
@@ -645,7 +662,21 @@ func fuzzyScore(params []float64, cpu, q, rt float64) float64 {
 	return mTotal / aTotal
 }
 
-func fuzzify(v, a, b, c float64) float64 {
+func fuzzifyLeft(v, a, b, c float64) float64 {
+	if v <= b {
+		return 1
+	}
+	if v >= c {
+		return 0
+	}
+	den := c - b
+	if den <= 0 {
+		return 0
+	}
+	return (c - v) / den
+}
+
+func fuzzifyTriangle(v, a, b, c float64) float64 {
 	if v == b {
 		return 1
 	}
@@ -664,6 +695,20 @@ func fuzzify(v, a, b, c float64) float64 {
 		return 0
 	}
 	return (c - v) / den
+}
+
+func fuzzifyRight(v, a, b, c float64) float64 {
+	if v >= b {
+		return 1
+	}
+	if v <= a {
+		return 0
+	}
+	den := b - a
+	if den <= 0 {
+		return 0
+	}
+	return (v - a) / den
 }
 
 func min3(a, b, c float64) float64 {

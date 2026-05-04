@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -42,7 +43,7 @@ const (
 	fmopsoParamsPath    = "storage/fmopso_params.json"
 	paretoFrontPath     = "storage/pareto_front.json"
 	// Asumsi baseline idle CPU host (dalam persen) untuk model replay FMOPSO.
-	osIdleCPU10 = 10.0
+	osIdleCPU10 = 3.0
 )
 
 /*
@@ -339,6 +340,23 @@ func sanitizeFuzzyParams(params []float64) []float64 {
 		out[i+1] = b
 		out[i+2] = c
 	}
+
+	// Overlap enforcement per variabel linguistik (3 segitiga: Low, Medium, High)
+	// untuk menghindari dead zone antar himpunan.
+	for i := 0; i+8 < len(out); i += 9 {
+		// Gap antara Low.c dan Medium.a
+		if out[i+2] < out[i+3] {
+			mid := (out[i+2] + out[i+3]) / 2
+			out[i+2] = mid
+			out[i+3] = mid
+		}
+		// Gap antara Medium.c dan High.a
+		if out[i+5] < out[i+6] {
+			mid := (out[i+5] + out[i+6]) / 2
+			out[i+5] = mid
+			out[i+6] = mid
+		}
+	}
 	return out
 }
 
@@ -448,6 +466,8 @@ func (p *NodePool) startMetricsCollector(interval time.Duration) {
 }
 
 var rrBalancer = roundrobin.New()
+var decisionRNG = rand.New(rand.NewSource(time.Now().UnixNano()))
+var decisionRNGMu sync.Mutex
 
 // selectBackend_RoundRobin memilih node berdasarkan rotasi indeks atomik.
 func (p *NodePool) selectBackend_RoundRobin() *Node {
@@ -474,17 +494,20 @@ func (p *NodePool) selectBackendByFuzzyEngine(engine *fuzzy.Engine, decisionTag 
 	Prosedur audit keputusan fuzzy (satu request):
 	1) Ambil snapshot immutable tiap node -> (CPU, Queue, Resp) tidak berubah selama evaluasi request ini.
 	2) Hitung skor Mamdani per node menggunakan rule base yang sama.
-	3) Pilih skor terbesar sebagai kandidat utama.
-	4) Jika skor sama persis (tie), gunakan tie-break berurutan:
-	   a. CPU lebih kecil menang (mengurangi risiko overload jangka pendek),
-	   b. jika CPU sama, latency lebih kecil menang (mengurangi tail-latency),
-	   c. jika tetap sama, urutan nama node (lexicographic) sebagai deterministic fallback.
+	3) Gunakan weighted probabilistic selection (roulette wheel):
+	   probabilitas terpilih proporsional terhadap skor Mamdani.
+	4) Jika total skor tidak valid (<= 0), fallback ke round robin.
 
 	Pola ini penting untuk audit manual karena setiap keputusan dapat direkonstruksi
 	dari satu baris log DECISION tanpa ketergantungan urutan goroutine.
 	*/
-	var bestNode *NodeDecisionSnapshot
-	maxScore := -1.0
+	type scoredNode struct {
+		snapshot NodeDecisionSnapshot
+		score    float64
+	}
+
+	scoredNodes := make([]scoredNode, 0, len(p.nodes))
+	totalScore := 0.0
 	var detailLog string
 
 	for _, node := range p.nodes {
@@ -497,25 +520,45 @@ func (p *NodePool) selectBackendByFuzzyEngine(engine *fuzzy.Engine, decisionTag 
 
 		score := engine.CalculateMamdani(metrics, myRules)
 		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=%.4f] ", snap.Name, metrics.CPU, metrics.QueueLength, metrics.RespTime, score)
+		if score < 0 {
+			score = 0
+		}
+		scoredNodes = append(scoredNodes, scoredNode{
+			snapshot: snap,
+			score:    score,
+		})
+		totalScore += score
+	}
 
-		if score > maxScore {
-			maxScore = score
-			s := snap
-			bestNode = &s
-		} else if score == maxScore && bestNode != nil {
-			if snap.CPU < bestNode.CPU ||
-				(snap.CPU == bestNode.CPU && snap.RespMS < bestNode.RespMS) ||
-				(snap.CPU == bestNode.CPU && snap.RespMS == bestNode.RespMS && snap.Name < bestNode.Name) {
-				s := snap
-				bestNode = &s
-			}
+	if len(scoredNodes) == 0 {
+		return nil
+	}
+
+	if totalScore <= 0 {
+		selectedNode := p.selectBackend_RoundRobin()
+		if selectedNode != nil {
+			log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (%s, fallback=ROUND_ROBIN totalScore=%.4f): %s\n", p.activeParamProfile(), detailLog, decisionTag, totalScore, selectedNode.Name)
+		}
+		return selectedNode
+	}
+
+	decisionRNGMu.Lock()
+	roulette := decisionRNG.Float64() * totalScore
+	decisionRNGMu.Unlock()
+
+	cumulativeScore := 0.0
+	for _, candidate := range scoredNodes {
+		cumulativeScore += candidate.score
+		if roulette <= cumulativeScore {
+			log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (%s, roulette=%.4f/%.4f): %s\n", p.activeParamProfile(), detailLog, decisionTag, roulette, totalScore, candidate.snapshot.Name)
+			return candidate.snapshot.Node
 		}
 	}
-	if bestNode != nil {
-		log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (%s): %s\n", p.activeParamProfile(), detailLog, decisionTag, bestNode.Name)
-		return bestNode.Node
-	}
-	return nil
+
+	// Fallback defensif untuk kasus rounding floating-point.
+	last := scoredNodes[len(scoredNodes)-1]
+	log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (%s, fallback=LAST_NODE roulette=%.4f/%.4f): %s\n", p.activeParamProfile(), detailLog, decisionTag, roulette, totalScore, last.snapshot.Name)
+	return last.snapshot.Node
 }
 
 // selectBackend_Fuzzy_Static memakai parameter fuzzy statis (base/optimized).
@@ -920,8 +963,8 @@ func loadRuntimeConfig() RuntimeConfig {
 		MOPSOMode:         mopsoMode,
 		ParamSource:       envLower("FUZZY_PARAM_SOURCE", "base"),
 		TrafficLogMode:    trafficLogMode,
-		MetricsInterval:   envDurationMS("METRICS_INTERVAL", 200*time.Millisecond),
-		OptimizerInterval: envDurationMS("OPTIMIZER_INTERVAL", 1*time.Second),
+		MetricsInterval:   envDurationMS("METRICS_INTERVAL", 500*time.Millisecond),
+		OptimizerInterval: envDurationMS("OPTIMIZER_INTERVAL", 2*time.Second),
 		AlgoLogInterval:   envDurationMS("ALGO_STATUS_LOG_INTERVAL", 30*time.Second),
 		BackendDNS:        []string{"http://api-node1:8080", "http://api-node2:8080"},
 	}
@@ -1077,7 +1120,7 @@ func newHTTPServer(handler http.Handler) *http.Server {
 		Addr:         ":8080",
 		Handler:      handler,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 30 * time.Second,
 	}
 }
 
@@ -1088,7 +1131,7 @@ func main() {
 
 	cfg := loadRuntimeConfig()
 	fuzzyBootstrap := initializeFuzzyEngines(cfg.ParamSource)
-	metricsClient := &http.Client{Timeout: 500 * time.Millisecond}
+	metricsClient := &http.Client{Timeout: 1500 * time.Millisecond}
 	pool := newNodePool(metricsClient, cfg, fuzzyBootstrap.ParamProfile)
 	if err := registerBackendNodes(pool, cfg.BackendDNS); err != nil {
 		log.Fatalf("Gagal mendaftarkan backend: %v", err)
