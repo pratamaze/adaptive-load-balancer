@@ -37,9 +37,16 @@ func TestFuzzyLogic(t *testing.T) {
 	fmt.Println("   HASIL SIMULASI MAMDANI (SKRIPSI)   ")
 	fmt.Println("==========================================")
 
+	// Gunakan jalur yang sama dengan runtime: engine instance + parameter eksplisit.
+	defaultParams := []float64{
+		0, 0, 50, 0, 50, 100, 50, 100, 100,
+		0, 0, 50, 0, 50, 100, 50, 100, 100,
+		0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+	}
+	engine := NewEngine(defaultParams)
+
 	for _, tc := range testCases {
-		// Menggunakan fungsi CalculateMamdani sesuai algoritma skripsi
-		score := CalculateMamdani(tc.metrics, rules)
+		score := engine.CalculateMamdani(tc.metrics, rules)
 
 		fmt.Printf("[%s]\n", tc.name)
 		fmt.Printf("  -> Input  : CPU: %.1f%%, Queue: %.0f, Resp: %.1fms\n",
