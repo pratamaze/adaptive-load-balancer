@@ -145,7 +145,7 @@ func respLabelToIndex(label string) int {
 func CalculateMamdani(node NodeMetrics, rules []Rule) float64 {
 	defaultParams := []float64{
 		0, 0, 50, 0, 50, 100, 50, 100, 100,
-		0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+		0, 0, 50, 0, 50, 100, 50, 100, 100,
 		0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
 	}
 	engine := NewEngine(defaultParams)

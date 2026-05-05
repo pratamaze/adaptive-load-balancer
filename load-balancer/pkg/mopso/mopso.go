@@ -10,12 +10,12 @@ import (
 const (
 	Dimensions   = 27
 	NumParticles = 20
-	Iterations   = 1800
+	Iterations   = 1900
 	maxArchive   = 128
-	inertiaMaxW  = 0.92
-	inertiaMinW  = 0.36
-	cognitiveC1  = 1.15
-	socialC2     = 2.05
+	inertiaMaxW  = 0.50
+	inertiaMinW  = 0.40
+	cognitiveC1  = 1.0
+	socialC2     = 2.0
 )
 
 // NodeState menyimpan data historis + metrik observasi saat replay.
@@ -190,6 +190,19 @@ func OptimizeReplay(baseParams []float64, snap HistoricalSnapshot) ParetoResult 
 		return result
 	}
 
+	// Elitism Injection:
+	// siapkan 1 seed baseline yang selalu hadir di swarm agar tidak kehilangan
+	// "ingatan" parameter fuzzy statis ketika eksplorasi partikel lain memburuk.
+	seedParams := make([]float64, Dimensions)
+	for d := 0; d < Dimensions; d++ {
+		base := lowerBound(d)
+		if d < len(baseParams) {
+			base = baseParams[d]
+		}
+		seedParams[d] = clamp(base, lowerBound(d), upperBound(d))
+	}
+	repairParams(seedParams)
+
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	particles := make([]particle, NumParticles)
 	archive := make([]Solution, 0, 32)
@@ -198,8 +211,30 @@ func OptimizeReplay(baseParams []float64, snap HistoricalSnapshot) ParetoResult 
 		x := make([]float64, Dimensions)
 		v := make([]float64, Dimensions)
 		pb := make([]float64, Dimensions)
+
+		if i == 0 {
+			// Partikel elit: posisi awal = baseline, pBest awal = baseline.
+			copy(x, seedParams)
+			copy(pb, seedParams)
+			obj, sim1, sim2 := eval.evaluate(x)
+			particles[i] = particle{
+				x:       x,
+				v:       v, // nol agar seed baseline stabil saat iterasi awal
+				pbest:   pb,
+				pbestO:  obj,
+				hasBest: true,
+			}
+			archive = addToArchive(archive, Solution{
+				Params:        clone27(x),
+				Objective:     obj,
+				SimulatedCPU1: sim1,
+				SimulatedCPU2: sim2,
+			})
+			continue
+		}
+
 		for d := 0; d < Dimensions; d++ {
-			base := baseParams[d]
+			base := seedParams[d]
 			rangeDelta := 8.0
 			x[d] = clamp(base+(rng.Float64()*2*rangeDelta-rangeDelta), lowerBound(d), upperBound(d))
 			v[d] = rng.Float64()*2 - 1

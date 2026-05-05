@@ -13,7 +13,7 @@ REMOTE_BASE_DIR ?= /home/ripe/load-balancer
 LB_STORAGE_DIR ?= $(REMOTE_BASE_DIR)/storage
 LB_CONFIGS_DIR ?= $(REMOTE_BASE_DIR)/configs
 
-LOCAL_DATASET ?= $(LB_MODULE_DIR)/storage/fuzzy_training_data_clean.csv
+LOCAL_DATASET ?= $(LB_MODULE_DIR)/storage/fuzzy_training_data.csv
 LOCAL_BASE_PARAMS ?= $(LB_MODULE_DIR)/configs/base_fuzzy_params.json
 LOCAL_OPT_PARAMS ?= $(LB_MODULE_DIR)/storage/optimized_fuzzy_params.json
 LOCAL_TRAIN_REPORT ?= $(LB_MODULE_DIR)/storage/mopso_offline_report.json
@@ -28,6 +28,12 @@ LB_MODE_LABEL_KEY ?= fmopso.mode
 LB_PUBLIC_SCHEME ?= http
 LB_PUBLIC_PORT ?= 80
 
+LB_IMAGE_REPO ?= pratamaze/lb
+NODE_IMAGE_REPO ?= pratamaze/node
+IMAGE_TAG ?= fmopso
+FMOPSO_IMAGE_TAG ?= fmopso
+FUZZY_IMAGE_TAG ?= fuzzy
+
 MOPSO_PARTICLES ?= 50
 MOPSO_ITERATIONS ?= 3000
 MOPSO_SPREAD ?= 8
@@ -36,16 +42,24 @@ MOPSO_RUNS ?= 5
 MOPSO_ALLOW_REGRESSION ?= false
 DATASET_LOG_SINCE ?= 20m
 
+LOCUST_FILE ?= $(CURDIR)/tests/locust/locustfile.py
+LOCUST_HOST ?= http://172.188.240.101
+LOCUST_ENDPOINT_PATH ?= /api/stress-test?ms=50
+LOCUST_OUT_DIR ?= $(CURDIR)/tests/locust/results
+
 DATASET_HEADER := timestamp_utc,window_ms,traffic_log_mode,cpu_usage_unit,node1_name,node2_name,node1_requests,node2_requests,total_requests,node1_cpu_raw_usage,node2_cpu_raw_usage,node1_cpu_normalized_usage,node2_cpu_normalized_usage,node1_cpu_capacity,node2_cpu_capacity,node1_queue,node2_queue,node1_response_ms,node2_response_ms,node1_fuzzy_score,node2_fuzzy_score,os_idle_cpu
 
 SSH_OPTS := -i $(SSH_KEY) -p $(SSH_PORT)
 SCP_OPTS := -i $(SSH_KEY) -P $(SSH_PORT)
 REMOTE_ADDR := $(REMOTE_USER)@$(REMOTE_HOST)
 
-.PHONY: help dataset-pull dataset-capture-live train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source show-lb-runtime verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source
+.PHONY: help image-build image-push image-build-push image-deploy image-update image-update-fmopso image-update-fuzzy dataset-pull dataset-capture-live train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source show-lb-runtime verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source locust-normal locust-spike locust-ramp
 
 help:
 	@echo "Available targets:"
+	@echo "  make image-update-fmopso # Build+push+redeploy image tag fmopso dan aktifkan mode fmopso"
+	@echo "  make image-update-fuzzy  # Build+push+redeploy image tag fuzzy dan aktifkan mode fuzzy"
+	@echo "  make image-update IMAGE_TAG=<tag> # Build+push+redeploy image custom tag"
 	@echo "  make dataset-pull     # Snapshot dataset CSV dari stdout docker service logs"
 	@echo "  make dataset-capture-live # Capture dataset live dari stdout docker service logs (Ctrl+C untuk stop)"
 	@echo "  make train-mopso      # Training MOPSO offline di laptop"
@@ -57,6 +71,36 @@ help:
 	@echo "  make prep-fmopso-realtime # Aktifkan FMOPSO realtime (adaptive optimizer live)"
 	@echo "  make show-lb-runtime   # Cek runtime status via HTTP /lb/runtime"
 	@echo "  make logs-lb-source    # Tampilkan marker source parameter dari log entrypoint"
+	@echo "  make locust-normal     # Jalankan load test Locust skenario normal (4 menit)"
+	@echo "  make locust-spike      # Jalankan load test Locust skenario spike (5 menit)"
+	@echo "  make locust-ramp       # Jalankan load test Locust skenario ramp/stress (5 menit)"
+
+image-build:
+	docker build -t $(LB_IMAGE_REPO):$(IMAGE_TAG) $(LB_MODULE_DIR)
+	docker build -t $(NODE_IMAGE_REPO):$(IMAGE_TAG) $(CURDIR)/api-service
+	@echo "Images built: $(LB_IMAGE_REPO):$(IMAGE_TAG), $(NODE_IMAGE_REPO):$(IMAGE_TAG)"
+
+image-push:
+	docker push $(LB_IMAGE_REPO):$(IMAGE_TAG)
+	docker push $(NODE_IMAGE_REPO):$(IMAGE_TAG)
+	@echo "Images pushed: $(LB_IMAGE_REPO):$(IMAGE_TAG), $(NODE_IMAGE_REPO):$(IMAGE_TAG)"
+
+image-build-push: image-build image-push
+
+image-deploy:
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "\
+		docker service update --detach=true --with-registry-auth --force --image $(LB_IMAGE_REPO):$(IMAGE_TAG) $(LB_SERVICE) && \
+		docker service update --detach=true --with-registry-auth --force --image $(NODE_IMAGE_REPO):$(IMAGE_TAG) $(NODE1_SERVICE) && \
+		docker service update --detach=true --with-registry-auth --force --image $(NODE_IMAGE_REPO):$(IMAGE_TAG) $(NODE2_SERVICE)"
+	@echo "Services updated to tag $(IMAGE_TAG)"
+
+image-update: image-build-push image-deploy
+
+image-update-fmopso: IMAGE_TAG=$(FMOPSO_IMAGE_TAG)
+image-update-fmopso: image-update prep-fmopso-realtime
+
+image-update-fuzzy: IMAGE_TAG=$(FUZZY_IMAGE_TAG)
+image-update-fuzzy: image-update prep-fuzzy
 
 dataset-pull:
 	@mkdir -p $(dir $(LOCAL_DATASET))
@@ -220,3 +264,15 @@ logs-lb-source:
 	@echo "=== LB Source Markers From Service Logs ($(LB_SERVICE)) ==="
 	ssh $(SSH_OPTS) $(REMOTE_ADDR) '\
 		docker service logs --raw --timestamps --since 20m --tail 400 $(LB_SERVICE) 2>&1 | grep -E "ENTRYPOINT\\]\\[PARAM-SOURCE|ENTRYPOINT\\]\\[PARAM-SNAPSHOT|\\[FUZZY\\]|\\[RUNTIME\\]\\[ALGO-STATUS\\]|Memulai Load Balancer" || true'
+
+locust-normal:
+	@mkdir -p $(LOCUST_OUT_DIR)
+	locust -f $(LOCUST_FILE) --host $(LOCUST_HOST) --headless --scenario normal --endpoint-path "$(LOCUST_ENDPOINT_PATH)" --csv $(LOCUST_OUT_DIR)/normal
+
+locust-spike:
+	@mkdir -p $(LOCUST_OUT_DIR)
+	locust -f $(LOCUST_FILE) --host $(LOCUST_HOST) --headless --scenario spike --endpoint-path "$(LOCUST_ENDPOINT_PATH)" --csv $(LOCUST_OUT_DIR)/spike
+
+locust-ramp:
+	@mkdir -p $(LOCUST_OUT_DIR)
+	locust -f $(LOCUST_FILE) --host $(LOCUST_HOST) --headless --scenario ramp --endpoint-path "$(LOCUST_ENDPOINT_PATH)" --csv $(LOCUST_OUT_DIR)/ramp

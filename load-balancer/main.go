@@ -57,6 +57,7 @@ type NodeMetrics struct {
 	CPUUsageRaw        float64 `json:"cpu_usage_raw"`
 	CPUUsageNormalized float64 `json:"cpu_usage_normalized"`
 	MemoryUsage        float64 `json:"memory_usage"`
+	MemoryUsageNorm    float64 `json:"memory_usage_normalized"`
 	LoadAverage1       float64 `json:"load_average_1"`
 	RequestLatencyMS   float64 `json:"request_latency_ms"`
 	InflightRequests   float64 `json:"inflight_requests"`
@@ -196,16 +197,25 @@ var myRules = []fuzzy.Rule{
 }
 
 var DefaultBaseFuzzyParams = []float64{
-	0, 0, 50, 0, 50, 100, 50, 100, 100,
-	0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
-	0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+	// CPU Usage: Rendah [0, 40, 75], Sedang [60, 80, 95], Tinggi [85, 95, 100]
+	// Sengaja ditarik ke atas agar CPU 70% masih dianggap wajar/aman.
+	0, 40, 75, 60, 80, 95, 85, 95, 100,
+
+	// Queue Length: Pendek [0, 50, 150], Sedang [100, 250, 400], Panjang [300, 500, 1000]
+	// Mensimulasikan backlog server Nginx. Fuzzy tidak akan panik sampai antrean menyentuh 300.
+	0, 50, 150, 100, 250, 400, 300, 500, 1000,
+
+	// Response Time: Cepat [0, 200, 800], Normal [500, 1500, 3000], Lambat [2000, 4000, 8000]
+	// Toleransi latensi dibuat sangat longgar hingga 2-3 detik.
+	0, 200, 800, 500, 1500, 3000, 2000, 4000, 8000,
 }
 
 var (
-	// StaticFuzzyEngine dipakai saat mode `fuzzy`.
-	StaticFuzzyEngine = fuzzy.NewEngine(DefaultBaseFuzzyParams)
-	// AdaptiveFMOPSOEngine dipakai saat mode `fmopso` dan bisa di-update realtime.
-	AdaptiveFMOPSOEngine = fuzzy.NewEngine(DefaultBaseFuzzyParams)
+	// Strict hardcode isolation:
+	// engine hanya dialokasikan sesuai algoritma aktif saat startup.
+	StaticFuzzyEngine    *fuzzy.Engine
+	AdaptiveFMOPSOEngine *fuzzy.Engine
+	BaselineSeedParams   []float64
 )
 
 // ensureDirs memastikan direktori runtime minimum selalu tersedia.
@@ -402,10 +412,7 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 		return
 	}
 
-	normalizedCPU := metrics.CPUUsage
-	if metrics.CPUUsageNormalized > 0 || metrics.CPUUsage == 0 {
-		normalizedCPU = metrics.CPUUsageNormalized
-	}
+	normalizedCPU := metrics.CPUUsageNormalized
 	if normalizedCPU < 0 {
 		normalizedCPU = 0
 	}
@@ -413,29 +420,30 @@ func (p *NodePool) getRealNodeMetrics(node *Node) {
 		normalizedCPU = 100
 	}
 
-	rawCPU := metrics.CPUUsageRaw
-	if rawCPU <= 0 && metrics.CPUCapacity > 0 {
-		rawCPU = normalizedCPU * (metrics.CPUCapacity / 100.0)
-	}
-
 	node.CPUUsage = normalizedCPU
-	node.CPURawUsage = rawCPU
+	node.CPURawUsage = normalizedCPU
 	node.LoadAverage = metrics.LoadAverage1
 	node.InflightReq = metrics.InflightRequests
-	node.MemoryUsage = metrics.MemoryUsage
+	normalizedMem := metrics.MemoryUsageNorm
+	if normalizedMem <= 0 {
+		normalizedMem = metrics.MemoryUsage
+	}
+	if normalizedMem < 0 {
+		normalizedMem = 0
+	}
+	if normalizedMem > 100 {
+		normalizedMem = 100
+	}
+	node.MemoryUsage = normalizedMem
 	if metrics.RequestLatencyMS > 0 {
 		node.ResponseTime = metrics.RequestLatencyMS
 	} else {
 		node.ResponseTime = responseTime
 	}
-	if metrics.CPUCapacity > 0 {
-		node.CPUCapacity = metrics.CPUCapacity
-	} else {
-		node.CPUCapacity = 100
-	}
+	node.CPUCapacity = 100
 
 	cpuGauge.WithLabelValues(node.Name).Set(normalizedCPU)
-	cpuRawGauge.WithLabelValues(node.Name).Set(rawCPU)
+	cpuRawGauge.WithLabelValues(node.Name).Set(normalizedCPU)
 	latencyGauge.WithLabelValues(node.Name).Set(node.ResponseTime)
 }
 
@@ -490,6 +498,11 @@ func (p *NodePool) selectBackend_RoundRobin() *Node {
 // selectBackendByFuzzyEngine adalah jalur umum seleksi fuzzy.
 // Engine disuntikkan agar bisa dipakai ulang untuk mode fuzzy statis dan FMOPSO adaptif.
 func (p *NodePool) selectBackendByFuzzyEngine(engine *fuzzy.Engine, decisionTag string) *Node {
+	if engine == nil {
+		log.Printf("[DECISION][SRC=%s] Engine %s tidak tersedia (nil), fallback round robin", p.activeParamProfile(), decisionTag)
+		return p.selectBackend_RoundRobin()
+	}
+
 	/**
 	Prosedur audit keputusan fuzzy (satu request):
 	1) Ambil snapshot immutable tiap node -> (CPU, Queue, Resp) tidak berubah selama evaluasi request ini.
@@ -573,16 +586,19 @@ func (p *NodePool) selectBackend_FMOPSO_Adaptive() *Node {
 
 // selectBackend adalah dispatcher utama algoritma load balancing.
 func (p *NodePool) selectBackend() *Node {
-	switch p.algorithm {
-	case "roundrobin":
-		return p.selectBackend_RoundRobin()
-	case "fuzzy":
-		return p.selectBackend_Fuzzy_Static()
-	case "fmopso":
+	if p.algorithm == "fmopso" {
+		if AdaptiveFMOPSOEngine == nil {
+			log.Printf("[DECISION][SRC=%s] ALGO=fmopso tetapi AdaptiveFMOPSOEngine nil, fallback round robin", p.activeParamProfile())
+			return p.selectBackend_RoundRobin()
+		}
 		return p.selectBackend_FMOPSO_Adaptive()
-	default:
-		return p.selectBackend_Fuzzy_Static()
 	}
+
+	if StaticFuzzyEngine == nil {
+		log.Printf("[DECISION][SRC=%s] ALGO=fuzzy tetapi StaticFuzzyEngine nil, fallback round robin", p.activeParamProfile())
+		return p.selectBackend_RoundRobin()
+	}
+	return p.selectBackend_Fuzzy_Static()
 }
 
 /*
@@ -618,6 +634,11 @@ Catatan audit:
 */
 func (p *NodePool) startMOPSOOptimizer(interval time.Duration) {
 	if p.algorithm != "fmopso" || len(p.nodes) < 2 {
+		log.Println("[AUDIT] MOPSO Optimizer is explicitly DISABLED because algorithm is not fmopso.")
+		return
+	}
+	if AdaptiveFMOPSOEngine == nil {
+		log.Println("[AUDIT] MOPSO Optimizer is explicitly DISABLED because adaptive engine is nil.")
 		return
 	}
 
@@ -636,8 +657,11 @@ func (p *NodePool) startMOPSOOptimizer(interval time.Duration) {
 			n1, n2 := p.snapshotNodePair()
 			snapshot := buildReplaySnapshot(n1, n2, r1, r2)
 
-			base := AdaptiveFMOPSOEngine.GetParams()
-			result := mopso.OptimizeReplay(base, snapshot)
+			seedBase := BaselineSeedParams
+			if len(seedBase) == 0 {
+				seedBase = AdaptiveFMOPSOEngine.GetParams()
+			}
+			result := mopso.OptimizeReplay(seedBase, snapshot)
 			if len(result.Archive) == 0 || len(result.Compromises) == 0 {
 				continue
 			}
@@ -741,8 +765,7 @@ func (p *NodePool) snapshotNodePair() (Node, Node) {
 buildReplaySnapshot mengubah snapshot runtime node menjadi format input replay FMOPSO.
 
 Mapping audit yang perlu diperhatikan:
-  - CPUUsage pada replay memakai `CPURawUsage` (bukan CPU normalized), karena evaluator replay
-    menghitung estimasi biaya CPU/request pada domain absolut host.
+  - CPUUsage pada replay memakai nilai ternormalisasi 0..100 dari collector backend.
   - QueueLength memakai `nodeQueueSignal` = max(inflight*30, loadAvg*10).
   - Requests berasal dari delta request interval berjalan (`r1`,`r2`), bukan total kumulatif.
   - OSIdleCPU10 adalah baseline idle CPU yang dipakai model replay untuk menghindari biaya/request negatif.
@@ -751,15 +774,15 @@ func buildReplaySnapshot(n1, n2 Node, r1, r2 int64) mopso.HistoricalSnapshot {
 	return mopso.HistoricalSnapshot{
 		OSIdleCPU10: osIdleCPU10,
 		Node1: mopso.NodeState{
-			CPUUsage:     n1.CPURawUsage,
-			CPUCapacity:  n1.CPUCapacity,
+			CPUUsage:     n1.CPUUsage,
+			CPUCapacity:  100,
 			QueueLength:  nodeQueueSignal(&n1),
 			ResponseTime: n1.ResponseTime,
 			Requests:     r1,
 		},
 		Node2: mopso.NodeState{
-			CPUUsage:     n2.CPURawUsage,
-			CPUCapacity:  n2.CPUCapacity,
+			CPUUsage:     n2.CPUUsage,
+			CPUCapacity:  100,
 			QueueLength:  nodeQueueSignal(&n2),
 			ResponseTime: n2.ResponseTime,
 			Requests:     r2,
@@ -860,7 +883,7 @@ var (
 		[]string{"node_name"},
 	)
 	cpuRawGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{Name: "pso_node_cpu_usage_raw", Help: "Penggunaan CPU node backend absolut sebelum normalisasi (%)"},
+		prometheus.GaugeOpts{Name: "pso_node_cpu_usage_raw", Help: "Mirror penggunaan CPU node backend (nilai normalized untuk kompatibilitas historis)"},
 		[]string{"node_name"},
 	)
 	latencyGauge = prometheus.NewGaugeVec(
@@ -953,9 +976,9 @@ func normalizeMOPSOMode(value string) string {
 	}
 }
 
-// loadRuntimeConfig memuat seluruh konfigurasi runtime dari env.
+// loadRuntimeConfig memuat konfigurasi runtime dengan hardcode isolasi algoritma.
 func loadRuntimeConfig() RuntimeConfig {
-	algorithm := normalizeAlgorithm(envLower("LB_ALGO", "fuzzy"))
+	algorithm := "fuzzy" // UBAH MANUAL KE "fmopso" SAAT RE-DEPLOY
 	mopsoMode := normalizeMOPSOMode(envLower("MOPSO_BUSINESS_MODE", "balanced"))
 	trafficLogMode := normalizeTrafficLogMode(envLower("TRAFFIC_LOG_MODE", trafficLogModeWindow))
 	return RuntimeConfig{
@@ -963,20 +986,24 @@ func loadRuntimeConfig() RuntimeConfig {
 		MOPSOMode:         mopsoMode,
 		ParamSource:       envLower("FUZZY_PARAM_SOURCE", "base"),
 		TrafficLogMode:    trafficLogMode,
-		MetricsInterval:   envDurationMS("METRICS_INTERVAL", 500*time.Millisecond),
-		OptimizerInterval: envDurationMS("OPTIMIZER_INTERVAL", 2*time.Second),
+		MetricsInterval:   envDurationMS("METRICS_INTERVAL", 250*time.Millisecond),
+		OptimizerInterval: envDurationMS("OPTIMIZER_INTERVAL", 3*time.Second),
 		AlgoLogInterval:   envDurationMS("ALGO_STATUS_LOG_INTERVAL", 30*time.Second),
 		BackendDNS:        []string{"http://api-node1:8080", "http://api-node2:8080"},
 	}
 }
 
-// initializeFuzzyEngines menginisialisasi:
-// 1) engine fuzzy statis dari base/optimized source,
-// 2) engine adaptif FMOPSO dari state terakhir yang tersimpan.
-func initializeFuzzyEngines(paramSource string) FuzzyBootstrap {
+// initializeFuzzyEngines menginisialisasi engine sesuai mode algoritma aktif.
+// - fuzzy  -> hanya StaticFuzzyEngine
+// - fmopso -> hanya AdaptiveFMOPSOEngine
+func initializeFuzzyEngines(algorithm, paramSource string) FuzzyBootstrap {
+	StaticFuzzyEngine = nil
+	AdaptiveFMOPSOEngine = nil
+
 	ensureBaseParamsFile(baseFuzzyParamsPath, DefaultBaseFuzzyParams)
 	baseParams := loadFloatArrayWithFallback(baseFuzzyParamsPath, DefaultBaseFuzzyParams, "base fuzzy params")
 	baseParams = sanitizeFuzzyParams(baseParams)
+	BaselineSeedParams = append([]float64(nil), baseParams...)
 
 	bootstrap := FuzzyBootstrap{
 		StaticParams:     append([]float64(nil), baseParams...),
@@ -984,26 +1011,37 @@ func initializeFuzzyEngines(paramSource string) FuzzyBootstrap {
 		ActiveStaticFile: baseFuzzyParamsPath,
 	}
 
-	switch paramSource {
-	case "optimized":
-		bootstrap.StaticParams = loadFloatArrayWithFallback(optimizedFuzzyPath, baseParams, "parameter fuzzy teroptimasi")
-		bootstrap.ParamProfile = "OPTIMIZED"
-		bootstrap.ActiveStaticFile = optimizedFuzzyPath
-	default:
-		if paramSource != "base" {
-			log.Printf("[WARNING] FUZZY_PARAM_SOURCE tidak dikenal (%s), fallback ke base", paramSource)
+	switch algorithm {
+	case "fmopso":
+		bootstrap.FMOPSOParams = loadFloatArrayWithFallback(fmopsoParamsPath, baseParams, "parameter adaptif F-MOPSO")
+		bootstrap.FMOPSOParams = sanitizeFuzzyParams(bootstrap.FMOPSOParams)
+		bootstrap.ParamProfile = "FMOPSO"
+		bootstrap.ActiveStaticFile = fmopsoParamsPath
+		AdaptiveFMOPSOEngine = fuzzy.NewEngine(bootstrap.FMOPSOParams)
+	case "fuzzy":
+		switch paramSource {
+		case "optimized":
+			bootstrap.StaticParams = loadFloatArrayWithFallback(optimizedFuzzyPath, baseParams, "parameter fuzzy teroptimasi")
+			bootstrap.ParamProfile = "OPTIMIZED"
+			bootstrap.ActiveStaticFile = optimizedFuzzyPath
+		default:
+			if paramSource != "base" {
+				log.Printf("[WARNING] FUZZY_PARAM_SOURCE tidak dikenal (%s), fallback ke base", paramSource)
+			}
 		}
+		bootstrap.StaticParams = sanitizeFuzzyParams(bootstrap.StaticParams)
+		StaticFuzzyEngine = fuzzy.NewEngine(bootstrap.StaticParams)
+	default:
+		log.Printf("[WARNING] ALGO tidak dikenal (%s), fallback isolasi ke fuzzy/base", algorithm)
+		bootstrap.StaticParams = sanitizeFuzzyParams(bootstrap.StaticParams)
+		bootstrap.ParamProfile = "BASE"
+		bootstrap.ActiveStaticFile = baseFuzzyParamsPath
+		StaticFuzzyEngine = fuzzy.NewEngine(bootstrap.StaticParams)
 	}
-	bootstrap.StaticParams = sanitizeFuzzyParams(bootstrap.StaticParams)
-
-	bootstrap.FMOPSOParams = loadFloatArrayWithFallback(fmopsoParamsPath, baseParams, "parameter adaptif F-MOPSO")
-	bootstrap.FMOPSOParams = sanitizeFuzzyParams(bootstrap.FMOPSOParams)
-
-	StaticFuzzyEngine = fuzzy.NewEngine(bootstrap.StaticParams)
-	AdaptiveFMOPSOEngine = fuzzy.NewEngine(bootstrap.FMOPSOParams)
 
 	log.Printf(
-		"[ENTRYPOINT][PARAM-SOURCE] PROFILE=%s FUZZY_PARAM_SOURCE=%s ACTIVE_FILE=%s",
+		"[ENTRYPOINT][PARAM-SOURCE] ALGO=%s PROFILE=%s FUZZY_PARAM_SOURCE=%s ACTIVE_FILE=%s",
+		algorithm,
 		bootstrap.ParamProfile,
 		paramSource,
 		bootstrap.ActiveStaticFile,
@@ -1082,15 +1120,14 @@ func registerBackendNodes(pool *NodePool, backendDNS []string) error {
 func startRuntimeWorkers(pool *NodePool, cfg RuntimeConfig) {
 	pool.startMetricsCollector(cfg.MetricsInterval)
 	pool.startAlgoStatusLogger(cfg.AlgoLogInterval)
-	switch pool.algorithm {
-	case "fmopso":
+	if cfg.Algorithm == "fmopso" {
 		pool.startMOPSOOptimizer(cfg.OptimizerInterval)
-	case "fuzzy":
-		if pool.trafficLogMode == trafficLogModePerHit {
-			/* Recorder per-hit aktif melalui hook response proxy. */
-		} else {
-			pool.startFuzzyDatasetRecorder(cfg.OptimizerInterval)
-		}
+		return
+	}
+	if pool.trafficLogMode == trafficLogModePerHit {
+		/* Recorder per-hit aktif melalui hook response proxy. */
+	} else {
+		pool.startFuzzyDatasetRecorder(cfg.OptimizerInterval)
 	}
 }
 
@@ -1130,7 +1167,7 @@ func main() {
 	ensureDirs("configs", "storage")
 
 	cfg := loadRuntimeConfig()
-	fuzzyBootstrap := initializeFuzzyEngines(cfg.ParamSource)
+	fuzzyBootstrap := initializeFuzzyEngines(cfg.Algorithm, cfg.ParamSource)
 	metricsClient := &http.Client{Timeout: 1500 * time.Millisecond}
 	pool := newNodePool(metricsClient, cfg, fuzzyBootstrap.ParamProfile)
 	if err := registerBackendNodes(pool, cfg.BackendDNS); err != nil {

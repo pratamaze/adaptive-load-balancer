@@ -36,6 +36,9 @@ def hitung_evaluasi(file_log):
         return
 
     # 2. Hitung Rata-Rata CPU dan Latency
+    # NOTE:
+    # CPU di log DECISION diasumsikan sudah ternormalisasi 0..100 terhadap limit container.
+    # Tidak ada konversi balik ke kapasitas fisik dan tidak ada pembobotan kapasitas node.
     avg_cpu1 = sum(node1_cpus) / total_data
     avg_cpu2 = sum(node2_cpus) / total_data
     

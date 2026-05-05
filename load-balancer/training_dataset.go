@@ -71,6 +71,10 @@ func emitDatasetCSVRecord(record []string) {
 }
 
 func (p *NodePool) writeFuzzyTrainingSample(windowMS int64, mode string, r1, r2 int64) {
+	if StaticFuzzyEngine == nil {
+		log.Printf("[DATASET] StaticFuzzyEngine nil, skip sample mode=%s", mode)
+		return
+	}
 	if len(p.nodes) < 2 {
 		return
 	}
