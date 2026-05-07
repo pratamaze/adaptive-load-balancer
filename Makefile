@@ -176,7 +176,7 @@ prep-fuzzy:
 	@$(MAKE) verify-fuzzy
 
 prep-mopso:
-	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGO --env-add LB_ALGO=fuzzy --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=optimized --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --label-add $(LB_MODE_LABEL_KEY)=mopso-optimized $(LB_SERVICE)"
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGO --env-add LB_ALGO=fuzzy --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=optimized --env-rm TRAFFIC_LOG_MODE --env-add TRAFFIC_LOG_MODE=per_hit --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --label-add $(LB_MODE_LABEL_KEY)=mopso-optimized $(LB_SERVICE)"
 	@$(MAKE) reset-swarm
 	@$(MAKE) verify-mopso
 
@@ -232,8 +232,8 @@ verify-mopso:
 			   docker service inspect $(LB_SERVICE) --format "{{json .Spec.Labels}}" | grep -q "\"$(LB_MODE_LABEL_KEY)\":\"mopso-optimized\"" && \
 			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^LB_ALGO=fuzzy$$" && \
 			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^FUZZY_PARAM_SOURCE=optimized$$" && \
-			   ! docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^TRAFFIC_LOG_MODE="; then \
-				echo "OK: source=mopso-optimized, logging=off"; \
+			   docker inspect --format "{{range .Config.Env}}{{println .}}{{end}}" $$cid | grep -q "^TRAFFIC_LOG_MODE=per_hit$$"; then \
+				echo "OK: source=mopso-optimized, logging=per_hit"; \
 				exit 0; \
 			fi; \
 			sleep 2; \

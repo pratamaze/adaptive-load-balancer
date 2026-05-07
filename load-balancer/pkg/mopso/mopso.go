@@ -435,9 +435,9 @@ func upperBound(d int) float64 {
 	case d <= 8:
 		return 100
 	case d <= 17:
-		return 2000
+		return 1000
 	default:
-		return 2000
+		return 1000
 	}
 }
 
@@ -581,8 +581,8 @@ func repairParams(params []float64) {
 
 	// Jaga urutan label linguistik Low < Medium < High untuk puncak (b) tiap variabel.
 	enforcePeakOrder(params, 0, 2.0, 100.0)   // CPU
-	enforcePeakOrder(params, 9, 20.0, 2000.0) // Queue
-	enforcePeakOrder(params, 18, 20.0, 2000.0)
+	enforcePeakOrder(params, 9, 20.0, 1000.0) // Queue
+	enforcePeakOrder(params, 18, 20.0, 1000.0)
 
 	// Overlap enforcement per variabel linguistik (3 segitiga: Low, Medium, High)
 	// untuk menghindari dead zone antar himpunan.

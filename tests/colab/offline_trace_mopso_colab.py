@@ -24,6 +24,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import skfuzzy as fuzz
@@ -55,9 +56,9 @@ OUT_MF = np.array([[0.0, 25.0, 50.0], [25.0, 50.0, 75.0], [50.0, 75.0, 100.0]], 
 
 DEFAULT_BASE_PARAMS = np.array(
     [
-        0, 0, 50, 0, 50, 100, 50, 100, 100,
-        0, 0, 50, 0, 50, 100, 50, 100, 100,
-        0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+        0, 40, 75, 60, 80, 95, 85, 95, 100,
+        0, 50, 150, 100, 250, 400, 300, 500, 1000,
+        0, 150, 300, 200, 500, 800, 600, 850, 1000,
     ],
     dtype=np.float64,
 )
@@ -141,6 +142,7 @@ class OfflineResult:
     best_balanced: OfflineSolution
     best_di: OfflineSolution
     best_bcu: OfflineSolution
+    score_history: List[float]
 
 
 # ----------------------------
@@ -159,7 +161,7 @@ def upper_bound(d: int) -> float:
     if d <= 8:
         return 100.0
     if d <= 17:
-        return 100.0
+        return 1000.0
     return 1000.0
 
 
@@ -256,7 +258,7 @@ def repair_params(params: np.ndarray) -> np.ndarray:
     p = clone_params(params)
 
     for i in range(0, p.shape[0] - 2, 3):
-        min_gap = 2.0 if i <= 17 else 20.0
+        min_gap = 2.0 if i <= 8 else 20.0
 
         a = float(np.clip(p[i], lower_bound(i), upper_bound(i)))
         b = float(np.clip(p[i + 1], lower_bound(i + 1), upper_bound(i + 1)))
@@ -296,7 +298,7 @@ def repair_params(params: np.ndarray) -> np.ndarray:
         p[i], p[i + 1], p[i + 2] = a, b, c
 
     enforce_peak_order(p, 0, 2.0, 100.0)
-    enforce_peak_order(p, 9, 5.0, 100.0)
+    enforce_peak_order(p, 9, 20.0, 1000.0)
     enforce_peak_order(p, 18, 20.0, 1000.0)
 
     # Overlap enforcement per variabel (3 segitiga per variabel)
@@ -654,6 +656,30 @@ def choose_sane_candidate(result: OfflineResult) -> Optional[OfflineSolution]:
     return None
 
 
+def plot_convergence(history: Sequence[float], scenario_name: str, out_dir: str | Path) -> Path:
+    out_dir_path = Path(out_dir)
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir_path / f"convergence_trace_{scenario_name}.png"
+
+    if len(history) == 0:
+        return out_file
+
+    x = np.arange(1, len(history) + 1)
+    y = np.asarray(history, dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(x, y, color="#1f77b4", linewidth=2.0, label="Best Balanced Score")
+    ax.set_title(f"Convergence Trace - {scenario_name}")
+    ax.set_xlabel("Iterasi")
+    ax.set_ylabel("Balanced Score (Fitness)")
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_file, dpi=150)
+    plt.close(fig)
+    return out_file
+
+
 def optimize_offline(ds: OfflineDataset, base_params: np.ndarray, cfg: OfflineConfig) -> OfflineResult:
     cfg = cfg.normalized()
     base_params = repair_params(base_params)
@@ -683,6 +709,8 @@ def optimize_offline(ds: OfflineDataset, base_params: np.ndarray, cfg: OfflineCo
         pbest[i] = x[i].copy()
 
     archive: List[OfflineSolution] = []
+    score_history: List[float] = []
+    best_score_so_far = float("inf")
 
     for t in range(cfg.iterations):
         w = INERTIA_MAX_W - (INERTIA_MAX_W - INERTIA_MIN_W) * (float(t) / float(max_int(cfg.iterations - 1, 1)))
@@ -704,7 +732,13 @@ def optimize_offline(ds: OfflineDataset, base_params: np.ndarray, cfg: OfflineCo
             archive = add_to_archive(archive, cand)
 
         if not archive:
+            score_history.append(best_score_so_far)
             continue
+
+        iter_best = min(sol.objective.balanced_score for sol in archive)
+        if iter_best < best_score_so_far:
+            best_score_so_far = iter_best
+        score_history.append(best_score_so_far)
 
         for i in range(cfg.particles):
             leader = archive[int(rng.integers(0, len(archive)))]
@@ -742,6 +776,7 @@ def optimize_offline(ds: OfflineDataset, base_params: np.ndarray, cfg: OfflineCo
         best_balanced=best_balanced,
         best_di=best_di,
         best_bcu=best_bcu,
+        score_history=score_history,
     )
 
 
@@ -830,6 +865,7 @@ def run_scenario_optimization(
     scenario_name = ds.scenario_name
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    convergence_out = plot_convergence(best_result.score_history, scenario_name, out_dir)
 
     params_out = out_dir / f"opt_fuzzy_{scenario_name}.json"
     report_out = out_dir / f"mopso_report_{scenario_name}.json"
@@ -883,6 +919,8 @@ def run_scenario_optimization(
                 },
             },
             "archive": archive_export,
+            "convergence_plot": str(convergence_out),
+            "score_history": best_result.score_history,
         },
     }
 
@@ -897,6 +935,7 @@ def run_scenario_optimization(
         "used_samples": ds.used_samples,
         "base_score": base_score,
         "opt_score": opt_score,
+        "convergence_plot": str(convergence_out),
     }
 
 

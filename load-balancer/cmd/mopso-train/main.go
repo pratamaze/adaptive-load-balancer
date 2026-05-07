@@ -20,9 +20,9 @@ import (
 )
 
 var defaultBaseParams = []float64{
-	0, 0, 50, 0, 50, 100, 50, 100, 100,
-	0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
-	0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+	0, 40, 75, 60, 80, 95, 85, 95, 100,
+	0, 50, 150, 100, 250, 400, 300, 500, 1000,
+	0, 150, 300, 200, 500, 800, 600, 850, 1000,
 }
 
 func main() {
@@ -296,8 +296,8 @@ func forceSaneParams(params []float64) {
 	}
 
 	enforceOrderedPeaksLocal(params, 0, 2.0, 100.0)
-	enforceOrderedPeaksLocal(params, 9, 20.0, 2000.0)
-	enforceOrderedPeaksLocal(params, 18, 20.0, 2000.0)
+	enforceOrderedPeaksLocal(params, 9, 20.0, 1000.0)
+	enforceOrderedPeaksLocal(params, 18, 20.0, 1000.0)
 }
 
 func enforceOrderedPeaksLocal(params []float64, start int, minGap, hi float64) {
@@ -361,7 +361,7 @@ func boundsByDim(d int) (float64, float64) {
 	if d <= 8 {
 		return 0, 100
 	}
-	return 0, 2000
+	return 0, 1000
 }
 
 func clampLocal(v, lo, hi float64) float64 {

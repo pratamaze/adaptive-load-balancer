@@ -205,9 +205,9 @@ var DefaultBaseFuzzyParams = []float64{
 	// Mensimulasikan backlog server Nginx. Fuzzy tidak akan panik sampai antrean menyentuh 300.
 	0, 50, 150, 100, 250, 400, 300, 500, 1000,
 
-	// Response Time: Cepat [0, 200, 800], Normal [500, 1500, 3000], Lambat [2000, 4000, 8000]
-	// Toleransi latensi dibuat sangat longgar hingga 2-3 detik.
-	0, 200, 800, 500, 1500, 3000, 2000, 4000, 8000,
+	// Response Time: Cepat [0, 150, 300], Normal [200, 500, 800], Lambat [600, 850, 1000]
+	// Batas diselaraskan dengan SLA 1 detik.
+	0, 150, 300, 200, 500, 800, 600, 850, 1000,
 }
 
 var (
@@ -308,12 +308,12 @@ func applyMetricPenalty(node *Node) {
 }
 
 // sanitizeFuzzyParams memaksa 27 parameter ke domain valid dan urutan segitiga a<=b<=c.
-// CPU dibatasi [0..100], queue/resp dibatasi [0..2000].
+// CPU dibatasi [0..100], queue/resp dibatasi [0..1000].
 func sanitizeFuzzyParams(params []float64) []float64 {
 	out := append([]float64(nil), params...)
 	const eps = 1e-6
 	for i := 0; i+2 < len(out); i += 3 {
-		hi := 2000.0
+		hi := 1000.0
 		if i <= 6 {
 			hi = 100
 		}

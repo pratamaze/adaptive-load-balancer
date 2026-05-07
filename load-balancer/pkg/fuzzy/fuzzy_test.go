@@ -39,9 +39,9 @@ func TestFuzzyLogic(t *testing.T) {
 
 	// Gunakan jalur yang sama dengan runtime: engine instance + parameter eksplisit.
 	defaultParams := []float64{
-		0, 0, 50, 0, 50, 100, 50, 100, 100,
-		0, 0, 50, 0, 50, 100, 50, 100, 100,
-		0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
+		0, 40, 75, 60, 80, 95, 85, 95, 100,
+		0, 50, 150, 100, 250, 400, 300, 500, 1000,
+		0, 150, 300, 200, 500, 800, 600, 850, 1000,
 	}
 	engine := NewEngine(defaultParams)
 
