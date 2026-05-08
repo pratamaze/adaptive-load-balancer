@@ -41,6 +41,9 @@ MOPSO_SEED ?= 0
 MOPSO_RUNS ?= 5
 MOPSO_ALLOW_REGRESSION ?= false
 DATASET_LOG_SINCE ?= 20m
+DATASET_CONTAINER_PATH ?= /storage/fuzzy_training_data.csv
+LOCAL_CAPTURED_DATASET ?= ./logs/hasil_terbaru.csv
+REMOTE_CAPTURED_DATASET ?= $(REMOTE_BASE_DIR)/logs/hasil_terbaru.csv
 
 LOCUST_FILE ?= $(CURDIR)/tests/locust/locustfile.py
 LOCUST_HOST ?= http://172.188.240.101
@@ -53,7 +56,7 @@ SSH_OPTS := -i $(SSH_KEY) -p $(SSH_PORT)
 SCP_OPTS := -i $(SSH_KEY) -P $(SSH_PORT)
 REMOTE_ADDR := $(REMOTE_USER)@$(REMOTE_HOST)
 
-.PHONY: help image-build image-push image-build-push image-deploy image-update image-update-fmopso image-update-fuzzy dataset-pull dataset-capture-live train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source show-lb-runtime verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source locust-normal locust-spike locust-ramp
+.PHONY: help image-build image-push image-build-push image-deploy image-update image-update-fmopso image-update-fuzzy dataset-pull dataset-capture-live capture-dataset train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source show-lb-runtime verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source locust-normal locust-spike locust-ramp
 
 help:
 	@echo "Available targets:"
@@ -62,6 +65,7 @@ help:
 	@echo "  make image-update IMAGE_TAG=<tag> # Build+push+redeploy image custom tag"
 	@echo "  make dataset-pull     # Snapshot dataset CSV dari stdout docker service logs"
 	@echo "  make dataset-capture-live # Capture dataset live dari stdout docker service logs (Ctrl+C untuk stop)"
+	@echo "  make capture-dataset  # Reset dataset di container, tunggu load test selesai, lalu ambil CSV terbaru"
 	@echo "  make train-mopso      # Training MOPSO offline di laptop"
 	@echo "  make params-push      # Push parameter optimized ke VPS (configs/optimized_fuzzy_params.json)"
 	@echo "  make offline-flow     # Jalankan pull -> train -> push"
@@ -129,6 +133,20 @@ dataset-capture-live:
 			if (line == "" || line == header) next; \
 			print line; \
 		}' > $(LOCAL_DATASET)
+
+capture-dataset:
+	@mkdir -p ./logs
+	@cid=$$(ssh $(SSH_OPTS) $(REMOTE_ADDR) 'docker ps --filter label=com.docker.swarm.service.name=$(LB_SERVICE) --format "{{.ID}}" | head -n1'); \
+	if [ -z "$$cid" ]; then \
+		echo "LB container belum running untuk service $(LB_SERVICE)"; \
+		exit 1; \
+	fi; \
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker exec $$cid sh -c 'truncate -s 0 $(DATASET_CONTAINER_PATH) 2>/dev/null || : > $(DATASET_CONTAINER_PATH)'"; \
+	echo "Dataset di-reset. Silakan jalankan JMeter/Locust sekarang. Tekan ENTER jika load test sudah selesai..."; \
+	read -r _; \
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "mkdir -p $$(dirname $(REMOTE_CAPTURED_DATASET)) && docker cp $$cid:$(DATASET_CONTAINER_PATH) $(REMOTE_CAPTURED_DATASET)"; \
+	scp $(SCP_OPTS) $(REMOTE_ADDR):$(REMOTE_CAPTURED_DATASET) $(LOCAL_CAPTURED_DATASET); \
+	echo "Dataset berhasil disimpan di ./logs/hasil_terbaru.csv"
 
 train-mopso:
 	cd $(LB_MODULE_DIR) && go run ./cmd/mopso-train \
