@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"load-balancer/pkg/mopso"
+	"load-balancer/cmd/mopso-train/internal/mopso"
 )
 
 var defaultBaseParams = []float64{
