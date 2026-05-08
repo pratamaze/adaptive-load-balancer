@@ -47,7 +47,7 @@ LOCUST_HOST ?= http://172.188.240.101
 LOCUST_ENDPOINT_PATH ?= /api/stress-test?ms=50
 LOCUST_OUT_DIR ?= $(CURDIR)/tests/locust/results
 
-DATASET_HEADER := timestamp_utc,window_ms,traffic_log_mode,cpu_usage_unit,node1_name,node2_name,node1_requests,node2_requests,total_requests,node1_cpu_raw_usage,node2_cpu_raw_usage,node1_cpu_normalized_usage,node2_cpu_normalized_usage,node1_cpu_capacity,node2_cpu_capacity,node1_queue,node2_queue,node1_response_ms,node2_response_ms,node1_fuzzy_score,node2_fuzzy_score,os_idle_cpu
+DATASET_HEADER := timestamp_utc,window_ms,traffic_log_mode,cpu_usage_unit,node1_name,node2_name,node1_requests,node2_requests,total_requests,node1_cpu_raw_usage,node2_cpu_raw_usage,node1_cpu_normalized_usage,node2_cpu_normalized_usage,node1_cpu_capacity,node2_cpu_capacity,node1_inflight,node2_inflight,node1_backend_inflight,node2_backend_inflight,node1_queue,node2_queue,node1_response_ms,node2_response_ms,node1_fuzzy_score,node2_fuzzy_score,os_idle_cpu
 
 SSH_OPTS := -i $(SSH_KEY) -p $(SSH_PORT)
 SCP_OPTS := -i $(SSH_KEY) -P $(SSH_PORT)

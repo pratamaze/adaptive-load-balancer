@@ -34,6 +34,10 @@ var fuzzyTrainingDataHeader = []string{
 	"node2_cpu_normalized_usage",
 	"node1_cpu_capacity",
 	"node2_cpu_capacity",
+	"node1_inflight",
+	"node2_inflight",
+	"node1_backend_inflight",
+	"node2_backend_inflight",
 	"node1_queue",
 	"node2_queue",
 	"node1_response_ms",
@@ -70,6 +74,34 @@ func emitDatasetCSVRecord(record []string) {
 	emitDatasetCSVLine(strings.Join(record, ","))
 }
 
+type datasetNodeSample struct {
+	Name            string
+	CPURawUsage     float64
+	CPUUsage        float64
+	CPUCapacity     float64
+	BackendInflight float64
+	ProxyInflight   float64
+	ResponseMS      float64
+}
+
+func sampleNodeForDataset(node *Node) datasetNodeSample {
+	node.mutex.RLock()
+	out := datasetNodeSample{
+		Name:            node.Name,
+		CPURawUsage:     node.CPURawUsage,
+		CPUUsage:        node.CPUUsage,
+		CPUCapacity:     node.CPUCapacity,
+		BackendInflight: node.InflightReq,
+		ResponseMS:      node.ResponseTime,
+	}
+	node.mutex.RUnlock()
+	out.ProxyInflight = node.proxyInflightValue()
+	if lastProxyRespMS := node.lastProxyLatencyMS(); lastProxyRespMS > 0 {
+		out.ResponseMS = lastProxyRespMS
+	}
+	return out
+}
+
 func (p *NodePool) writeFuzzyTrainingSample(windowMS int64, mode string, r1, r2 int64) {
 	if StaticFuzzyEngine == nil {
 		log.Printf("[DATASET] StaticFuzzyEngine nil, skip sample mode=%s", mode)
@@ -83,15 +115,14 @@ func (p *NodePool) writeFuzzyTrainingSample(windowMS int64, mode string, r1, r2 
 		return
 	}
 
-	p.nodes[0].mutex.RLock()
-	n1 := *p.nodes[0]
-	p.nodes[0].mutex.RUnlock()
-	p.nodes[1].mutex.RLock()
-	n2 := *p.nodes[1]
-	p.nodes[1].mutex.RUnlock()
+	n1 := sampleNodeForDataset(p.nodes[0])
+	n2 := sampleNodeForDataset(p.nodes[1])
+	// Queue untuk dataset dipetakan ke inflight riil agar sample merefleksikan antrean aktif.
+	queue1 := n1.ProxyInflight
+	queue2 := n2.ProxyInflight
 
-	m1 := fuzzy.NodeMetrics{CPU: n1.CPUUsage, QueueLength: nodeQueueSignal(&n1), RespTime: n1.ResponseTime}
-	m2 := fuzzy.NodeMetrics{CPU: n2.CPUUsage, QueueLength: nodeQueueSignal(&n2), RespTime: n2.ResponseTime}
+	m1 := fuzzy.NodeMetrics{CPU: n1.CPUUsage, QueueLength: queue1, RespTime: n1.ResponseMS}
+	m2 := fuzzy.NodeMetrics{CPU: n2.CPUUsage, QueueLength: queue2, RespTime: n2.ResponseMS}
 	score1 := StaticFuzzyEngine.CalculateMamdani(m1, myRules)
 	score2 := StaticFuzzyEngine.CalculateMamdani(m2, myRules)
 
@@ -111,10 +142,14 @@ func (p *NodePool) writeFuzzyTrainingSample(windowMS int64, mode string, r1, r2 
 		formatFloatCSV(n2.CPUUsage),
 		formatFloatCSV(n1.CPUCapacity),
 		formatFloatCSV(n2.CPUCapacity),
+		formatFloatCSV(n1.ProxyInflight),
+		formatFloatCSV(n2.ProxyInflight),
+		formatFloatCSV(n1.BackendInflight),
+		formatFloatCSV(n2.BackendInflight),
 		formatFloatCSV(m1.QueueLength),
 		formatFloatCSV(m2.QueueLength),
-		formatFloatCSV(n1.ResponseTime),
-		formatFloatCSV(n2.ResponseTime),
+		formatFloatCSV(n1.ResponseMS),
+		formatFloatCSV(n2.ResponseMS),
 		formatFloatCSV(score1),
 		formatFloatCSV(score2),
 		formatFloatCSV(osIdleCPU10),
@@ -123,7 +158,7 @@ func (p *NodePool) writeFuzzyTrainingSample(windowMS int64, mode string, r1, r2 
 	emitDatasetCSVRecord(record)
 }
 
-func (p *NodePool) recordPerHitBySelectedNode(selectedNode string) {
+func (p *NodePool) recordPerHitByDecisionSnapshot(snapshot *DecisionSnapshot, selectedNodeFallback string) {
 	if p.algorithm != "fuzzy" {
 		return
 	}
@@ -133,19 +168,73 @@ func (p *NodePool) recordPerHitBySelectedNode(selectedNode string) {
 	if len(p.nodes) < 2 {
 		return
 	}
+	if snapshot == nil {
+		log.Printf("[DATASET] Snapshot decision tidak tersedia, skip per-hit CSV")
+		return
+	}
 
-	emitDatasetCSVHeader()
+	node1Name := snapshot.Node1Name
+	if strings.TrimSpace(node1Name) == "" {
+		node1Name = p.nodes[0].Name
+	}
+	node2Name := snapshot.Node2Name
+	if strings.TrimSpace(node2Name) == "" {
+		node2Name = p.nodes[1].Name
+	}
 
 	r1, r2 := int64(0), int64(0)
-	switch strings.TrimSpace(selectedNode) {
-	case p.nodes[0].Name:
+	selectedNode := strings.TrimSpace(snapshot.SelectedNode)
+	if selectedNode == "" {
+		selectedNode = strings.TrimSpace(selectedNodeFallback)
+	}
+	switch selectedNode {
+	case node1Name:
 		r1 = 1
-	case p.nodes[1].Name:
+	case node2Name:
 		r2 = 1
 	default:
 		return
 	}
-	p.writeFuzzyTrainingSample(0, trafficLogModePerHit, r1, r2)
+
+	cpuCap1 := snapshot.Node1CPUCap
+	cpuCap2 := snapshot.Node2CPUCap
+	if cpuCap1 <= 0 {
+		cpuCap1 = 100
+	}
+	if cpuCap2 <= 0 {
+		cpuCap2 = 100
+	}
+
+	record := []string{
+		time.Now().UTC().Format(time.RFC3339Nano),
+		"0",
+		trafficLogModePerHit,
+		cpuUsageUnitRaw,
+		node1Name,
+		node2Name,
+		strconv.FormatInt(r1, 10),
+		strconv.FormatInt(r2, 10),
+		strconv.FormatInt(r1+r2, 10),
+		formatFloatCSV(snapshot.Node1CPURaw),
+		formatFloatCSV(snapshot.Node2CPURaw),
+		formatFloatCSV(snapshot.CPU1),
+		formatFloatCSV(snapshot.CPU2),
+		formatFloatCSV(cpuCap1),
+		formatFloatCSV(cpuCap2),
+		formatFloatCSV(snapshot.Q1),
+		formatFloatCSV(snapshot.Q2),
+		formatFloatCSV(snapshot.Node1BackendQ),
+		formatFloatCSV(snapshot.Node2BackendQ),
+		formatFloatCSV(snapshot.Q1),
+		formatFloatCSV(snapshot.Q2),
+		formatFloatCSV(snapshot.RT1),
+		formatFloatCSV(snapshot.RT2),
+		formatFloatCSV(snapshot.Score1),
+		formatFloatCSV(snapshot.Score2),
+		formatFloatCSV(osIdleCPU10),
+	}
+
+	emitDatasetCSVRecord(record)
 }
 
 func (p *NodePool) startFuzzyDatasetRecorder(interval time.Duration) {

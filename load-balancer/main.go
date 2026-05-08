@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,8 +83,41 @@ type Node struct {
 	ResponseTime float64
 	CPUCapacity  float64
 
-	RequestCount atomic.Int64
-	mutex        sync.RWMutex
+	RequestCount        atomic.Int64
+	proxyInflight       int64
+	lastProxyLatencyBit atomic.Uint64
+	mutex               sync.RWMutex
+}
+
+func (n *Node) incrementProxyInflight() {
+	atomic.AddInt64(&n.proxyInflight, 1)
+}
+
+func (n *Node) decrementProxyInflight() {
+	for {
+		current := atomic.LoadInt64(&n.proxyInflight)
+		if current <= 0 {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&n.proxyInflight, current, current-1) {
+			return
+		}
+	}
+}
+
+func (n *Node) proxyInflightValue() float64 {
+	return float64(atomic.LoadInt64(&n.proxyInflight))
+}
+
+func (n *Node) setLastProxyLatencyMS(ms float64) {
+	if ms <= 0 {
+		return
+	}
+	n.lastProxyLatencyBit.Store(math.Float64bits(ms))
+}
+
+func (n *Node) lastProxyLatencyMS() float64 {
+	return math.Float64frombits(n.lastProxyLatencyBit.Load())
 }
 
 /*
@@ -93,7 +128,7 @@ Tujuan utama:
 2) memudahkan audit manual karena nilai input fuzzy terlihat eksplisit dan konsisten,
 3) mencegah bug lock yang salah objek (misalnya lock node A tapi membaca node B).
 
-Field Queue adalah sinyal antrean gabungan hasil fungsi `nodeQueueSignal`.
+Field Queue adalah snapshot antrean real-time dari proxy inflight (atomic).
 */
 type NodeDecisionSnapshot struct {
 	Node     *Node
@@ -106,6 +141,41 @@ type NodeDecisionSnapshot struct {
 	Inflight float64
 	LoadAvg  float64
 }
+
+type scoredNode struct {
+	snapshot NodeDecisionSnapshot
+	score    float64
+}
+
+// DecisionSnapshot adalah single source of truth untuk satu keputusan routing.
+// Nilai di struct ini harus sama persis dengan input fuzzy + hasil roulette pada request tersebut.
+type DecisionSnapshot struct {
+	Node1Name       string
+	Node2Name       string
+	CPU1            float64
+	CPU2            float64
+	Q1              float64
+	Q2              float64
+	RT1             float64
+	RT2             float64
+	Score1          float64
+	Score2          float64
+	SelectedNode    string
+	RouletteValue   float64
+	Node1CPURaw     float64
+	Node2CPURaw     float64
+	Node1CPUCap     float64
+	Node2CPUCap     float64
+	Node1BackendQ   float64
+	Node2BackendQ   float64
+	Node1LoadAvg    float64
+	Node2LoadAvg    float64
+	DecisionTag     string
+	TotalScore      float64
+	DecisionTimeUTC string
+}
+
+type decisionSnapshotContextKey struct{}
 
 /*
 *
@@ -157,6 +227,8 @@ type FuzzyBootstrap struct {
 }
 
 const selectedNodeTraceHeader = "X-LB-Selected-Node"
+const requestStartTraceHeader = "X-LB-Request-Start-UnixNano"
+const decisionAuditLogEnabled = true
 
 /*
 *
@@ -267,27 +339,20 @@ func saveJSONToFile(filename string, payload any) error {
 	return enc.Encode(payload)
 }
 
-// nodeQueueSignal menurunkan dua sinyal antrean (inflight vs load average) menjadi satu skor queue.
-// Nilai maksimum dipilih agar cepat merespons bottleneck yang paling dominan.
-func nodeQueueSignal(n *Node) float64 {
-	// Gabungkan in-flight request dengan load average host untuk sinyal queue yang lebih responsif.
-	inflightSignal := n.InflightReq * 30.0
-	loadSignal := n.LoadAverage * 10.0
-	if inflightSignal > loadSignal {
-		return inflightSignal
-	}
-	return loadSignal
-}
-
 // snapshotNodeForDecision membaca metrik node sekali lalu mengunci keputusan pada snapshot immutable.
 func snapshotNodeForDecision(node *Node) NodeDecisionSnapshot {
+	queue := float64(atomic.LoadInt64(&node.proxyInflight))
+	return snapshotNodeForDecisionWithQueue(node, queue)
+}
+
+func snapshotNodeForDecisionWithQueue(node *Node, queue float64) NodeDecisionSnapshot {
 	node.mutex.RLock()
 	defer node.mutex.RUnlock()
 	return NodeDecisionSnapshot{
 		Node:     node,
 		Name:     node.Name,
 		CPU:      node.CPUUsage,
-		Queue:    nodeQueueSignal(node),
+		Queue:    queue,
 		RespMS:   node.ResponseTime,
 		CPURaw:   node.CPURawUsage,
 		CPUCap:   node.CPUCapacity,
@@ -477,6 +542,82 @@ var rrBalancer = roundrobin.New()
 var decisionRNG = rand.New(rand.NewSource(time.Now().UnixNano()))
 var decisionRNGMu sync.Mutex
 
+func withDecisionSnapshot(ctx context.Context, snapshot *DecisionSnapshot) context.Context {
+	if snapshot == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, decisionSnapshotContextKey{}, snapshot)
+}
+
+func decisionSnapshotFromRequest(req *http.Request) *DecisionSnapshot {
+	if req == nil {
+		return nil
+	}
+	raw := req.Context().Value(decisionSnapshotContextKey{})
+	if raw == nil {
+		return nil
+	}
+	snapshot, ok := raw.(*DecisionSnapshot)
+	if !ok {
+		return nil
+	}
+	return snapshot
+}
+
+func buildDecisionSnapshot(scoredNodes []scoredNode, decisionTag string) *DecisionSnapshot {
+	if len(scoredNodes) == 0 {
+		return nil
+	}
+	out := &DecisionSnapshot{
+		DecisionTag:     decisionTag,
+		RouletteValue:   -1,
+		DecisionTimeUTC: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	n1 := scoredNodes[0]
+	out.Node1Name = n1.snapshot.Name
+	out.CPU1 = n1.snapshot.CPU
+	out.Q1 = n1.snapshot.Queue
+	out.RT1 = n1.snapshot.RespMS
+	out.Score1 = n1.score
+	out.Node1CPURaw = n1.snapshot.CPURaw
+	out.Node1CPUCap = n1.snapshot.CPUCap
+	out.Node1BackendQ = n1.snapshot.Inflight
+	out.Node1LoadAvg = n1.snapshot.LoadAvg
+
+	if len(scoredNodes) > 1 {
+		n2 := scoredNodes[1]
+		out.Node2Name = n2.snapshot.Name
+		out.CPU2 = n2.snapshot.CPU
+		out.Q2 = n2.snapshot.Queue
+		out.RT2 = n2.snapshot.RespMS
+		out.Score2 = n2.score
+		out.Node2CPURaw = n2.snapshot.CPURaw
+		out.Node2CPUCap = n2.snapshot.CPUCap
+		out.Node2BackendQ = n2.snapshot.Inflight
+		out.Node2LoadAvg = n2.snapshot.LoadAvg
+	}
+	return out
+}
+
+func emitDecisionAudit(snapshot *DecisionSnapshot) {
+	if !decisionAuditLogEnabled || snapshot == nil {
+		return
+	}
+	winner := strings.TrimSpace(snapshot.SelectedNode)
+	if winner == "" {
+		winner = "-"
+	}
+	log.Printf(
+		"[DECISION_AUDIT] | Q1:%.2f | Q2:%.2f | S1:%.4f | S2:%.4f | R:%.4f | Win:%s",
+		snapshot.Q1,
+		snapshot.Q2,
+		snapshot.Score1,
+		snapshot.Score2,
+		snapshot.RouletteValue,
+		winner,
+	)
+}
+
 // selectBackend_RoundRobin memilih node berdasarkan rotasi indeks atomik.
 func (p *NodePool) selectBackend_RoundRobin() *Node {
 	totalNodes := len(p.nodes)
@@ -484,23 +625,15 @@ func (p *NodePool) selectBackend_RoundRobin() *Node {
 		return nil
 	}
 	idx := rrBalancer.NextIndex(totalNodes)
-	selectedNode := p.nodes[idx]
-
-	var detailLog string
-	for _, node := range p.nodes {
-		snap := snapshotNodeForDecision(node)
-		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=0.0000] ", snap.Name, snap.CPU, snap.Queue, snap.RespMS)
-	}
-	log.Printf("[DECISION][SRC=%s] %s==> TERPILIH: %s\n", p.activeParamProfile(), detailLog, selectedNode.Name)
-	return selectedNode
+	return p.nodes[idx]
 }
 
 // selectBackendByFuzzyEngine adalah jalur umum seleksi fuzzy.
 // Engine disuntikkan agar bisa dipakai ulang untuk mode fuzzy statis dan FMOPSO adaptif.
-func (p *NodePool) selectBackendByFuzzyEngine(engine *fuzzy.Engine, decisionTag string) *Node {
+func (p *NodePool) selectBackendByFuzzyEngine(engine *fuzzy.Engine, decisionTag string) (*Node, *DecisionSnapshot) {
 	if engine == nil {
 		log.Printf("[DECISION][SRC=%s] Engine %s tidak tersedia (nil), fallback round robin", p.activeParamProfile(), decisionTag)
-		return p.selectBackend_RoundRobin()
+		return p.selectBackend_RoundRobin(), nil
 	}
 
 	/**
@@ -514,17 +647,11 @@ func (p *NodePool) selectBackendByFuzzyEngine(engine *fuzzy.Engine, decisionTag 
 	Pola ini penting untuk audit manual karena setiap keputusan dapat direkonstruksi
 	dari satu baris log DECISION tanpa ketergantungan urutan goroutine.
 	*/
-	type scoredNode struct {
-		snapshot NodeDecisionSnapshot
-		score    float64
-	}
-
 	scoredNodes := make([]scoredNode, 0, len(p.nodes))
 	totalScore := 0.0
-	var detailLog string
-
 	for _, node := range p.nodes {
-		snap := snapshotNodeForDecision(node)
+		queue := float64(atomic.LoadInt64(&node.proxyInflight))
+		snap := snapshotNodeForDecisionWithQueue(node, queue)
 		metrics := fuzzy.NodeMetrics{
 			CPU:         snap.CPU,
 			QueueLength: snap.Queue,
@@ -532,7 +659,6 @@ func (p *NodePool) selectBackendByFuzzyEngine(engine *fuzzy.Engine, decisionTag 
 		}
 
 		score := engine.CalculateMamdani(metrics, myRules)
-		detailLog += fmt.Sprintf("[%s: CPU=%.2f%%, Q=%.2f, Lat=%.2fms -> Skor=%.4f] ", snap.Name, metrics.CPU, metrics.QueueLength, metrics.RespTime, score)
 		if score < 0 {
 			score = 0
 		}
@@ -544,15 +670,23 @@ func (p *NodePool) selectBackendByFuzzyEngine(engine *fuzzy.Engine, decisionTag 
 	}
 
 	if len(scoredNodes) == 0 {
-		return nil
+		return nil, nil
+	}
+
+	decisionSnapshot := buildDecisionSnapshot(scoredNodes, decisionTag)
+	if decisionSnapshot != nil {
+		decisionSnapshot.TotalScore = totalScore
 	}
 
 	if totalScore <= 0 {
 		selectedNode := p.selectBackend_RoundRobin()
 		if selectedNode != nil {
-			log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (%s, fallback=ROUND_ROBIN totalScore=%.4f): %s\n", p.activeParamProfile(), detailLog, decisionTag, totalScore, selectedNode.Name)
+			if decisionSnapshot != nil {
+				decisionSnapshot.SelectedNode = selectedNode.Name
+			}
 		}
-		return selectedNode
+		emitDecisionAudit(decisionSnapshot)
+		return selectedNode, decisionSnapshot
 	}
 
 	decisionRNGMu.Lock()
@@ -563,40 +697,48 @@ func (p *NodePool) selectBackendByFuzzyEngine(engine *fuzzy.Engine, decisionTag 
 	for _, candidate := range scoredNodes {
 		cumulativeScore += candidate.score
 		if roulette <= cumulativeScore {
-			log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (%s, roulette=%.4f/%.4f): %s\n", p.activeParamProfile(), detailLog, decisionTag, roulette, totalScore, candidate.snapshot.Name)
-			return candidate.snapshot.Node
+			if decisionSnapshot != nil {
+				decisionSnapshot.RouletteValue = roulette
+				decisionSnapshot.SelectedNode = candidate.snapshot.Name
+			}
+			emitDecisionAudit(decisionSnapshot)
+			return candidate.snapshot.Node, decisionSnapshot
 		}
 	}
 
 	// Fallback defensif untuk kasus rounding floating-point.
 	last := scoredNodes[len(scoredNodes)-1]
-	log.Printf("[DECISION][SRC=%s] %s ==> TERPILIH (%s, fallback=LAST_NODE roulette=%.4f/%.4f): %s\n", p.activeParamProfile(), detailLog, decisionTag, roulette, totalScore, last.snapshot.Name)
-	return last.snapshot.Node
+	if decisionSnapshot != nil {
+		decisionSnapshot.RouletteValue = roulette
+		decisionSnapshot.SelectedNode = last.snapshot.Name
+	}
+	emitDecisionAudit(decisionSnapshot)
+	return last.snapshot.Node, decisionSnapshot
 }
 
 // selectBackend_Fuzzy_Static memakai parameter fuzzy statis (base/optimized).
-func (p *NodePool) selectBackend_Fuzzy_Static() *Node {
+func (p *NodePool) selectBackend_Fuzzy_Static() (*Node, *DecisionSnapshot) {
 	return p.selectBackendByFuzzyEngine(StaticFuzzyEngine, "FUZZY")
 }
 
 // selectBackend_FMOPSO_Adaptive memakai parameter fuzzy yang di-update optimizer FMOPSO.
-func (p *NodePool) selectBackend_FMOPSO_Adaptive() *Node {
+func (p *NodePool) selectBackend_FMOPSO_Adaptive() (*Node, *DecisionSnapshot) {
 	return p.selectBackendByFuzzyEngine(AdaptiveFMOPSOEngine, "F-MOPSO")
 }
 
 // selectBackend adalah dispatcher utama algoritma load balancing.
-func (p *NodePool) selectBackend() *Node {
+func (p *NodePool) selectBackend() (*Node, *DecisionSnapshot) {
 	if p.algorithm == "fmopso" {
 		if AdaptiveFMOPSOEngine == nil {
 			log.Printf("[DECISION][SRC=%s] ALGO=fmopso tetapi AdaptiveFMOPSOEngine nil, fallback round robin", p.activeParamProfile())
-			return p.selectBackend_RoundRobin()
+			return p.selectBackend_RoundRobin(), nil
 		}
 		return p.selectBackend_FMOPSO_Adaptive()
 	}
 
 	if StaticFuzzyEngine == nil {
 		log.Printf("[DECISION][SRC=%s] ALGO=fuzzy tetapi StaticFuzzyEngine nil, fallback round robin", p.activeParamProfile())
-		return p.selectBackend_RoundRobin()
+		return p.selectBackend_RoundRobin(), nil
 	}
 	return p.selectBackend_Fuzzy_Static()
 }
@@ -752,10 +894,22 @@ func (p *NodePool) nextRequestWindow(prevReq1, prevReq2 *int64) (r1 int64, r2 in
 /** snapshotNodePair membuat snapshot immutable dari dua node backend. */
 func (p *NodePool) snapshotNodePair() (Node, Node) {
 	p.nodes[0].mutex.RLock()
-	n1 := *p.nodes[0]
+	n1 := Node{
+		Name:         p.nodes[0].Name,
+		CPUUsage:     p.nodes[0].CPUUsage,
+		InflightReq:  p.nodes[0].InflightReq,
+		LoadAverage:  p.nodes[0].LoadAverage,
+		ResponseTime: p.nodes[0].ResponseTime,
+	}
 	p.nodes[0].mutex.RUnlock()
 	p.nodes[1].mutex.RLock()
-	n2 := *p.nodes[1]
+	n2 := Node{
+		Name:         p.nodes[1].Name,
+		CPUUsage:     p.nodes[1].CPUUsage,
+		InflightReq:  p.nodes[1].InflightReq,
+		LoadAverage:  p.nodes[1].LoadAverage,
+		ResponseTime: p.nodes[1].ResponseTime,
+	}
 	p.nodes[1].mutex.RUnlock()
 	return n1, n2
 }
@@ -766,7 +920,7 @@ buildReplaySnapshot mengubah snapshot runtime node menjadi format input replay F
 
 Mapping audit yang perlu diperhatikan:
   - CPUUsage pada replay memakai nilai ternormalisasi 0..100 dari collector backend.
-  - QueueLength memakai `nodeQueueSignal` = max(inflight*30, loadAvg*10).
+  - QueueLength memakai proxy in-flight agar konsisten dengan jalur decision fuzzy.
   - Requests berasal dari delta request interval berjalan (`r1`,`r2`), bukan total kumulatif.
   - OSIdleCPU10 adalah baseline idle CPU yang dipakai model replay untuk menghindari biaya/request negatif.
 */
@@ -776,14 +930,14 @@ func buildReplaySnapshot(n1, n2 Node, r1, r2 int64) mopso.HistoricalSnapshot {
 		Node1: mopso.NodeState{
 			CPUUsage:     n1.CPUUsage,
 			CPUCapacity:  100,
-			QueueLength:  nodeQueueSignal(&n1),
+			QueueLength:  n1.InflightReq,
 			ResponseTime: n1.ResponseTime,
 			Requests:     r1,
 		},
 		Node2: mopso.NodeState{
 			CPUUsage:     n2.CPUUsage,
 			CPUCapacity:  100,
-			QueueLength:  nodeQueueSignal(&n2),
+			QueueLength:  n2.InflightReq,
 			ResponseTime: n2.ResponseTime,
 			Requests:     r2,
 		},
@@ -807,6 +961,53 @@ func (p *NodePool) nodeNameByHost(host string) string {
 	return "unknown-node"
 }
 
+func (p *NodePool) nodeByName(name string) *Node {
+	target := strings.TrimSpace(name)
+	if target == "" {
+		return nil
+	}
+	for _, n := range p.nodes {
+		if n == nil {
+			continue
+		}
+		if n.Name == target {
+			return n
+		}
+	}
+	return nil
+}
+
+func requestLatencyMSFromTraceHeader(req *http.Request) float64 {
+	if req == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(req.Header.Get(requestStartTraceHeader))
+	if raw == "" {
+		return 0
+	}
+	startUnixNano, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || startUnixNano <= 0 {
+		return 0
+	}
+	startTime := time.Unix(0, startUnixNano)
+	elapsed := time.Since(startTime).Seconds() * 1000.0
+	if elapsed <= 0 {
+		return 0
+	}
+	return elapsed
+}
+
+func (p *NodePool) finalizeProxyRequest(selectedNode string, latencyMS float64) {
+	node := p.nodeByName(selectedNode)
+	if node == nil {
+		return
+	}
+	node.decrementProxyInflight()
+	if latencyMS > 0 {
+		node.setLastProxyLatencyMS(latencyMS)
+	}
+}
+
 // newReverseProxy membangun reverse proxy dengan hook routing, tracing response, dan error handling.
 func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 	customTransport := &http.Transport{
@@ -821,17 +1022,20 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 	proxy := &httputil.ReverseProxy{
 		Transport: customTransport,
 		Director: func(req *http.Request) {
-			backendNode := pool.selectBackend()
+			backendNode, decisionSnapshot := pool.selectBackend()
 			if backendNode == nil {
 				log.Println("Gagal memilih backend, tidak ada node tersedia.")
 				return
 			}
 
+			backendNode.incrementProxyInflight()
 			backendNode.RequestCount.Add(1)
 			originalHost := req.Host
 			req.URL.Scheme = backendNode.URL.Scheme
 			req.URL.Host = backendNode.URL.Host
+			*req = *req.WithContext(withDecisionSnapshot(req.Context(), decisionSnapshot))
 			req.Header.Set(selectedNodeTraceHeader, backendNode.Name)
+			req.Header.Set(requestStartTraceHeader, strconv.FormatInt(time.Now().UnixNano(), 10))
 			req.Header.Set("X-Forwarded-Host", originalHost)
 			req.Host = originalHost
 		},
@@ -843,7 +1047,12 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 			if selectedNode == "" {
 				selectedNode = pool.nodeNameByHost(res.Request.URL.Host)
 			}
-			pool.recordPerHitBySelectedNode(selectedNode)
+			latencyMS := requestLatencyMSFromTraceHeader(res.Request)
+			if node := pool.nodeByName(selectedNode); node != nil && latencyMS > 0 {
+				node.setLastProxyLatencyMS(latencyMS)
+			}
+			pool.recordPerHitByDecisionSnapshot(decisionSnapshotFromRequest(res.Request), selectedNode)
+			pool.finalizeProxyRequest(selectedNode, 0)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -851,6 +1060,8 @@ func newReverseProxy(pool *NodePool) *httputil.ReverseProxy {
 			if selectedNode == "" && r.URL != nil {
 				selectedNode = pool.nodeNameByHost(r.URL.Host)
 			}
+			latencyMS := requestLatencyMSFromTraceHeader(r)
+			pool.finalizeProxyRequest(selectedNode, latencyMS)
 			targetHost := "unknown-host"
 			path := ""
 			if r.URL != nil {
@@ -1124,10 +1335,8 @@ func startRuntimeWorkers(pool *NodePool, cfg RuntimeConfig) {
 		pool.startMOPSOOptimizer(cfg.OptimizerInterval)
 		return
 	}
-	if pool.trafficLogMode == trafficLogModePerHit {
-		/* Recorder per-hit aktif melalui hook response proxy. */
-	} else {
-		pool.startFuzzyDatasetRecorder(cfg.OptimizerInterval)
+	if pool.trafficLogMode != trafficLogModePerHit {
+		log.Printf("[DATASET] TRAFFIC_LOG_MODE=%s dinonaktifkan agar CSV hanya memakai DecisionSnapshot per-request", pool.trafficLogMode)
 	}
 }
 

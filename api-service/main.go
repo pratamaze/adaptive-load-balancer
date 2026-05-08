@@ -34,6 +34,7 @@ var (
 	cpuLimitPercent        = 100.0
 	memoryLimitBytes       uint64
 	inflightRequests       atomic.Int64
+	requestLatencyLast     atomic.Uint64
 	requestLatencyEWMA     atomic.Uint64
 )
 
@@ -218,8 +219,20 @@ type NodeMetrics struct {
 	MemoryUsageNorm    float64 `json:"memory_usage_normalized"`
 	LoadAverage1       float64 `json:"load_average_1"`
 	RequestLatencyMS   float64 `json:"request_latency_ms"`
+	RequestLatencyEWMA float64 `json:"request_latency_ewma_ms"`
 	InflightRequests   float64 `json:"inflight_requests"`
 	CPUCapacity        float64 `json:"cpu_capacity_percent"`
+}
+
+func loadRequestLatencyLast() float64 {
+	return math.Float64frombits(requestLatencyLast.Load())
+}
+
+func storeRequestLatencyLast(sampleMS float64) {
+	if sampleMS <= 0 {
+		return
+	}
+	requestLatencyLast.Store(math.Float64bits(sampleMS))
 }
 
 func loadRequestLatencyEWMA() float64 {
@@ -265,7 +278,8 @@ func metricsJSONHandler(w http.ResponseWriter, r *http.Request, name string) {
 		MemoryUsage:        memUsageNormalized,
 		MemoryUsageNorm:    memUsageNormalized,
 		LoadAverage1:       loadAvg1,
-		RequestLatencyMS:   loadRequestLatencyEWMA(),
+		RequestLatencyMS:   loadRequestLatencyLast(),
+		RequestLatencyEWMA: loadRequestLatencyEWMA(),
 		InflightRequests:   float64(inflightRequests.Load()),
 		CPUCapacity:        100.0,
 	}
@@ -456,6 +470,7 @@ func withPrometheus(next http.Handler) http.Handler {
 
 		// Endpoint metrik tidak dipakai sebagai sinyal latency bisnis.
 		if r.URL.Path != "/metrics" && r.URL.Path != "/metrics/prometheus" {
+			storeRequestLatencyLast(durationMS)
 			updateRequestLatencyEWMA(durationMS)
 		}
 	})
