@@ -347,10 +347,8 @@ func newDecisionSnapshot(nodes []lbtypes.BackendNode, decisionTag string) *lbtyp
 		out.CPU1 = n1.CPU
 		out.Q1 = n1.Queue
 		out.RT1 = n1.RespMS
-		out.Node1CPURaw = n1.CPURaw
 		out.Node1CPUCap = n1.CPUCap
 		out.Node1BackendQ = n1.Inflight
-		out.Node1LoadAvg = n1.LoadAvg
 	}
 	if len(out.NodeSnapshots) > 1 {
 		n2 := out.NodeSnapshots[1]
@@ -358,10 +356,8 @@ func newDecisionSnapshot(nodes []lbtypes.BackendNode, decisionTag string) *lbtyp
 		out.CPU2 = n2.CPU
 		out.Q2 = n2.Queue
 		out.RT2 = n2.RespMS
-		out.Node2CPURaw = n2.CPURaw
 		out.Node2CPUCap = n2.CPUCap
 		out.Node2BackendQ = n2.Inflight
-		out.Node2LoadAvg = n2.LoadAvg
 	}
 	return out
 }
@@ -402,16 +398,9 @@ func ApplyMetricPenalty(node *lbtypes.BackendNode) {
 		return
 	}
 	snapshot := node.SnapshotForDecision()
-	cpuRaw := 100.0
-	if snapshot.CPUCap > 0 {
-		cpuRaw = snapshot.CPUCap
-	}
 	node.UpdateMetrics(
 		100.0,
-		cpuRaw,
-		snapshot.LoadAvg,
 		snapshot.Inflight,
-		snapshot.MemoryUsage,
 		99999.0,
 		snapshot.CPUCap,
 	)

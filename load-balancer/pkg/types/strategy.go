@@ -16,12 +16,8 @@ type BackendNode struct {
 	CPU      float64
 	Queue    float64
 	RespMS   float64
-	CPURaw   float64
 	CPUCap   float64
 	Inflight float64
-	LoadAvg  float64
-
-	MemoryUsage float64
 
 	RequestCount  atomic.Int64 `json:"-"`
 	ProxyInflight int64        `json:"-"`
@@ -35,26 +31,20 @@ func (n *BackendNode) SnapshotForDecision() BackendNode {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return BackendNode{
-		Name:        n.Name,
-		CPU:         n.CPU,
-		Queue:       queue,
-		RespMS:      n.RespMS,
-		CPURaw:      n.CPURaw,
-		CPUCap:      n.CPUCap,
-		Inflight:    n.Inflight,
-		LoadAvg:     n.LoadAvg,
-		MemoryUsage: n.MemoryUsage,
+		Name:     n.Name,
+		CPU:      n.CPU,
+		Queue:    queue,
+		RespMS:   n.RespMS,
+		CPUCap:   n.CPUCap,
+		Inflight: n.Inflight,
 	}
 }
 
-func (n *BackendNode) UpdateMetrics(cpu, cpuRaw, loadAvg, inflight, memoryUsage, responseMS, cpuCap float64) {
+func (n *BackendNode) UpdateMetrics(cpu, inflight, responseMS, cpuCap float64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.CPU = cpu
-	n.CPURaw = cpuRaw
-	n.LoadAvg = loadAvg
 	n.Inflight = inflight
-	n.MemoryUsage = memoryUsage
 	n.RespMS = responseMS
 	n.CPUCap = cpuCap
 }
@@ -85,14 +75,10 @@ type DecisionSnapshot struct {
 	Score2          float64
 	SelectedNode    string
 	RouletteValue   float64
-	Node1CPURaw     float64
-	Node2CPURaw     float64
 	Node1CPUCap     float64
 	Node2CPUCap     float64
 	Node1BackendQ   float64
 	Node2BackendQ   float64
-	Node1LoadAvg    float64
-	Node2LoadAvg    float64
 	DecisionTag     string
 	TotalScore      float64
 	DecisionTimeUTC string

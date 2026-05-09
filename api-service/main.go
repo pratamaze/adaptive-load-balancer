@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,7 +19,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/shirou/gopsutil/v3/load"
 	"github.com/shirou/gopsutil/v3/process"
 )
 
@@ -26,16 +26,9 @@ var nodeName string
 var hostName string
 var myProcess *process.Process
 var (
-	cachedCPU              float64
-	cachedCPURaw           float64
-	cachedMemoryNormalized float64
-	cpuMutex               sync.RWMutex
-	cpuHistory             []float64
-	cpuLimitPercent        = 100.0
-	memoryLimitBytes       uint64
-	inflightRequests       atomic.Int64
-	requestLatencyLast     atomic.Uint64
-	requestLatencyEWMA     atomic.Uint64
+	inflightRequests   atomic.Int64
+	requestLatencyLast atomic.Uint64
+	cpuSampleMu        sync.Mutex
 )
 
 var (
@@ -71,135 +64,8 @@ func init() {
 		log.Printf("[WARNING] Gagal inisialisasi pembaca metrik Container: %v", err)
 	}
 
-	cpuLimitPercent = parseCPULimitPercent()
-	memoryLimitBytes = parseMemoryLimitBytes()
-	if memoryLimitBytes == 0 {
-		log.Printf("[WARNING] Memory limit container tidak terdeteksi (env/cgroup). memory_usage_normalized akan fallback 0.")
-	}
-
 	if myProcess != nil {
 		myProcess.Percent(0)
-	}
-	go startResourceMonitor()
-}
-
-func parseCPULimitPercent() float64 {
-	limitStr := os.Getenv("CPU_LIMIT_PERCENT")
-	cpuLimit, err := strconv.ParseFloat(limitStr, 64)
-	if err != nil || cpuLimit <= 0 {
-		return 100.0
-	}
-	return cpuLimit
-}
-
-func parsePositiveUintFromEnv(key string) (uint64, bool) {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return 0, false
-	}
-	v, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil || v == 0 {
-		return 0, false
-	}
-	return v, true
-}
-
-func parsePositiveUintFromFile(path string) (uint64, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
-	}
-	raw := strings.TrimSpace(string(data))
-	if raw == "" || strings.EqualFold(raw, "max") {
-		return 0, false
-	}
-	v, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil || v == 0 {
-		return 0, false
-	}
-	// Nilai sangat besar biasanya menandakan "unlimited".
-	if v >= (1 << 60) {
-		return 0, false
-	}
-	return v, true
-}
-
-func parseMemoryLimitBytes() uint64 {
-	if v, ok := parsePositiveUintFromEnv("MEMORY_LIMIT_BYTES"); ok {
-		return v
-	}
-	if v, ok := parsePositiveUintFromEnv("CONTAINER_MEMORY_LIMIT_BYTES"); ok {
-		return v
-	}
-	if mb, ok := parsePositiveUintFromEnv("MEMORY_LIMIT_MB"); ok {
-		return mb * 1024 * 1024
-	}
-	// cgroup v2
-	if v, ok := parsePositiveUintFromFile("/sys/fs/cgroup/memory.max"); ok {
-		return v
-	}
-	// cgroup v1
-	if v, ok := parsePositiveUintFromFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); ok {
-		return v
-	}
-	return 0
-}
-
-func parseMemoryUsageBytes() (uint64, bool) {
-	// cgroup v2
-	if v, ok := parsePositiveUintFromFile("/sys/fs/cgroup/memory.current"); ok {
-		return v, true
-	}
-	// cgroup v1
-	if v, ok := parsePositiveUintFromFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"); ok {
-		return v, true
-	}
-	return 0, false
-}
-
-func startResourceMonitor() {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-	const windowSize = 5
-
-	for range ticker.C {
-		cpuMutex.Lock()
-		if myProcess != nil {
-			val, err := myProcess.Percent(0)
-			if err == nil {
-				scaledVal := (val / cpuLimitPercent) * 100.0
-				if scaledVal > 100.0 {
-					scaledVal = 100.0
-				}
-				if scaledVal < 0 {
-					scaledVal = 0
-				}
-
-				cachedCPURaw = val
-				cpuHistory = append(cpuHistory, scaledVal)
-				if len(cpuHistory) > windowSize {
-					cpuHistory = cpuHistory[1:]
-				}
-				sum := 0.0
-				for _, v := range cpuHistory {
-					sum += v
-				}
-				cachedCPU = sum / float64(len(cpuHistory))
-			}
-		}
-
-		memUsageBytes, ok := parseMemoryUsageBytes()
-		if ok && memoryLimitBytes > 0 {
-			memNorm := (float64(memUsageBytes) / float64(memoryLimitBytes)) * 100.0
-			if memNorm < 0 {
-				memNorm = 0
-			}
-			if memNorm > 100 {
-				memNorm = 100
-			}
-			cachedMemoryNormalized = memNorm
-		}
-		cpuMutex.Unlock()
 	}
 }
 
@@ -212,16 +78,9 @@ type ResponseData struct {
 
 type NodeMetrics struct {
 	NodeName           string  `json:"node_name"`
-	CPUUsage           float64 `json:"cpu_usage"`
-	CPUUsageRaw        float64 `json:"cpu_usage_raw"`
 	CPUUsageNormalized float64 `json:"cpu_usage_normalized"`
-	MemoryUsage        float64 `json:"memory_usage"`
-	MemoryUsageNorm    float64 `json:"memory_usage_normalized"`
-	LoadAverage1       float64 `json:"load_average_1"`
 	RequestLatencyMS   float64 `json:"request_latency_ms"`
-	RequestLatencyEWMA float64 `json:"request_latency_ewma_ms"`
 	InflightRequests   float64 `json:"inflight_requests"`
-	CPUCapacity        float64 `json:"cpu_capacity_percent"`
 }
 
 func loadRequestLatencyLast() float64 {
@@ -235,53 +94,39 @@ func storeRequestLatencyLast(sampleMS float64) {
 	requestLatencyLast.Store(math.Float64bits(sampleMS))
 }
 
-func loadRequestLatencyEWMA() float64 {
-	return math.Float64frombits(requestLatencyEWMA.Load())
-}
-
-func updateRequestLatencyEWMA(sampleMS float64) {
-	const alpha = 0.25
-	for {
-		currentBits := requestLatencyEWMA.Load()
-		current := math.Float64frombits(currentBits)
-		next := sampleMS
-		if current > 0 {
-			next = alpha*sampleMS + (1-alpha)*current
-		}
-		nextBits := math.Float64bits(next)
-		if requestLatencyEWMA.CompareAndSwap(currentBits, nextBits) {
-			return
-		}
+func instantaneousNormalizedCPU() float64 {
+	if myProcess == nil {
+		return 0
 	}
+
+	cpuSampleMu.Lock()
+	rawCPU, err := myProcess.Percent(0)
+	cpuSampleMu.Unlock()
+	if err != nil {
+		return 0
+	}
+
+	cores := float64(runtime.NumCPU())
+	if cores <= 0 {
+		cores = 1
+	}
+
+	normalized := rawCPU / cores
+	if normalized < 0 {
+		return 0
+	}
+	if normalized > 100 {
+		return 100
+	}
+	return normalized
 }
 
 func metricsJSONHandler(w http.ResponseWriter, r *http.Request, name string) {
-	var cpuUsage float64
-	var memUsageNormalized float64
-
-	cpuMutex.RLock()
-	cpuUsage = cachedCPU
-	memUsageNormalized = cachedMemoryNormalized
-	cpuMutex.RUnlock()
-
-	loadAvg1 := 0.0
-	loadAvg, err := load.Avg()
-	if err == nil {
-		loadAvg1 = loadAvg.Load1
-	}
-
 	metrics := NodeMetrics{
 		NodeName:           name,
-		CPUUsage:           cpuUsage,
-		CPUUsageRaw:        cpuUsage,
-		CPUUsageNormalized: cpuUsage,
-		MemoryUsage:        memUsageNormalized,
-		MemoryUsageNorm:    memUsageNormalized,
-		LoadAverage1:       loadAvg1,
+		CPUUsageNormalized: instantaneousNormalizedCPU(),
 		RequestLatencyMS:   loadRequestLatencyLast(),
-		RequestLatencyEWMA: loadRequestLatencyEWMA(),
 		InflightRequests:   float64(inflightRequests.Load()),
-		CPUCapacity:        100.0,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -471,7 +316,6 @@ func withPrometheus(next http.Handler) http.Handler {
 		// Endpoint metrik tidak dipakai sebagai sinyal latency bisnis.
 		if r.URL.Path != "/metrics" && r.URL.Path != "/metrics/prometheus" {
 			storeRequestLatencyLast(durationMS)
-			updateRequestLatencyEWMA(durationMS)
 		}
 	})
 }

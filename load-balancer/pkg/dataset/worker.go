@@ -169,8 +169,10 @@ func buildPerHitRecord(snapshot *lbtypes.DecisionSnapshot) ([]string, bool) {
 		strconv.FormatInt(r1, 10),
 		strconv.FormatInt(r2, 10),
 		strconv.FormatInt(r1+r2, 10),
-		formatFloatCSV(snapshot.Node1CPURaw),
-		formatFloatCSV(snapshot.Node2CPURaw),
+		// Kolom raw dipertahankan untuk kompatibilitas dataset historis;
+		// runtime kini hanya menyimpan CPU normalized.
+		formatFloatCSV(snapshot.CPU1),
+		formatFloatCSV(snapshot.CPU2),
 		formatFloatCSV(snapshot.CPU1),
 		formatFloatCSV(snapshot.CPU2),
 		formatFloatCSV(cpuCap1),

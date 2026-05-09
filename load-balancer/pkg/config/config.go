@@ -90,7 +90,7 @@ func Load() (RuntimeConfig, error) {
 	return RuntimeConfig{
 		Algorithm:              algorithm,
 		TrafficLogMode:         trafficLogMode,
-		MetricsInterval:        envDurationMS("METRICS_INTERVAL", 250*time.Millisecond),
+		MetricsInterval:        envDurationMS("METRICS_INTERVAL", 100*time.Millisecond),
 		AlgoLogInterval:        envDurationMS("ALGO_STATUS_LOG_INTERVAL", 30*time.Second),
 		ListenAddr:             ":8080",
 		BackendNodes:           backendNodes,

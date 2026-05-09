@@ -99,7 +99,7 @@ def evaluate_csv(file_path):
     positive_avg = valid_row & (row_avg_cpu > 0)
 
     di_instant = np.zeros(len(df), dtype=float)
-    di_instant[positive_avg] = (row_max_cpu[positive_avg] - row_min_cpu[positive_avg]) / row_avg_cpu[positive_avg]
+    di_instant[positive_avg] = (row_max_cpu[positive_avg] - row_min_cpu[positive_avg]) / row_max_cpu[positive_avg]
 
     dev1 = np.abs(cpu1 - row_avg_cpu)
     dev2 = np.abs(cpu2 - row_avg_cpu)

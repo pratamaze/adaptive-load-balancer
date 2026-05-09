@@ -136,6 +136,7 @@ dataset-capture-live:
 
 capture-dataset:
 	@mkdir -p ./logs
+	@mkdir -p $(dir $(LOCAL_CAPTURED_DATASET))
 	@cid=$$(ssh $(SSH_OPTS) $(REMOTE_ADDR) 'docker ps --filter label=com.docker.swarm.service.name=$(LB_SERVICE) --format "{{.ID}}" | head -n1'); \
 	if [ -z "$$cid" ]; then \
 		echo "LB container belum running untuk service $(LB_SERVICE)"; \
@@ -145,7 +146,17 @@ capture-dataset:
 	echo "Dataset di-reset. Silakan jalankan JMeter/Locust sekarang. Tekan ENTER jika load test sudah selesai..."; \
 	read -r _; \
 	ssh $(SSH_OPTS) $(REMOTE_ADDR) "mkdir -p $$(dirname $(REMOTE_CAPTURED_DATASET)) && docker cp $$cid:$(DATASET_CONTAINER_PATH) $(REMOTE_CAPTURED_DATASET)"; \
-	scp $(SCP_OPTS) $(REMOTE_ADDR):$(REMOTE_CAPTURED_DATASET) $(LOCAL_CAPTURED_DATASET); \
+	tmp_file="$(LOCAL_CAPTURED_DATASET).tmp"; \
+	scp $(SCP_OPTS) $(REMOTE_ADDR):$(REMOTE_CAPTURED_DATASET) "$$tmp_file"; \
+	awk -v header='$(DATASET_HEADER)' '\
+		BEGIN { print header } \
+		{ \
+			line=$$0; \
+			gsub(/\r/, "", line); \
+			if (line == "" || line == header) next; \
+			print line; \
+		}' "$$tmp_file" > $(LOCAL_CAPTURED_DATASET); \
+	rm -f "$$tmp_file"; \
 	echo "Dataset berhasil disimpan di ./logs/hasil_terbaru.csv"
 
 train-mopso:
