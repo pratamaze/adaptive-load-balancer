@@ -3,7 +3,6 @@ package main
 import (
 	"log"
 	"net/http"
-	"time"
 
 	"load-balancer/pkg/algorithm/fuzzy"
 	"load-balancer/pkg/algorithm/roundrobin"
@@ -12,6 +11,8 @@ import (
 	"load-balancer/pkg/metrics"
 	"load-balancer/pkg/proxy"
 	lbtypes "load-balancer/pkg/types"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -30,11 +31,19 @@ func main() {
 		activeStrategy = fuzzy.NewFuzzyBaseStrategy(cfg.Fuzzy.BaseEngine, config.DefaultRules)
 	}
 
-	metricsClient := &http.Client{Timeout: 1500 * time.Millisecond}
 	decisionSnapshotC := dataset.NewSnapshotChannel(cfg.DecisionSnapshotBuffer)
 
-	go metrics.StartCollector(cfg.BackendNodes, metricsClient, cfg.MetricsInterval, cfg.Fuzzy.ParamProfile)
+	metrics.StartCollector(cfg.BackendNodes, cfg.MetricsInterval, cfg.Fuzzy.ParamProfile)
 	go dataset.StartWorker("storage/fuzzy_training_data.csv", decisionSnapshotC, cfg.Algorithm, cfg.TrafficLogMode)
+	go func() {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.Handler())
+		const metricsAddr = ":9090"
+		log.Printf("[METRICS] Prometheus endpoint aktif di %s/metrics", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, metricsMux); err != nil {
+			log.Fatalf("[METRICS] Gagal memulai endpoint metrics: %v", err)
+		}
+	}()
 
 	lbProxy := proxy.NewLBProxy(proxy.LBProxyConfig{
 		Nodes:             cfg.BackendNodes,

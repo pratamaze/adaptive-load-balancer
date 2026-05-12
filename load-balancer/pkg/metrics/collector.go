@@ -2,59 +2,36 @@ package metrics
 
 import (
 	"encoding/json"
-	"io"
 	"log"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"load-balancer/pkg/proxy"
 	lbtypes "load-balancer/pkg/types"
-
-	"github.com/prometheus/client_golang/prometheus"
 )
 
-type NodeMetrics struct {
-	NodeName           string  `json:"node_name"`
-	CPUUsageNormalized float64 `json:"cpu_usage_normalized"`
-	RequestLatencyMS   float64 `json:"request_latency_ms"`
-	InflightRequests   float64 `json:"inflight_requests"`
+const metricsCollectInterval = 500 * time.Millisecond
+
+type cpuTelemetryPayload struct {
+	CPUPercent float64 `json:"cpu_percent"`
 }
 
-var (
-	cpuGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{Name: "pso_node_cpu_usage", Help: "Penggunaan CPU node backend ternormalisasi kapasitas (%)"},
-		[]string{"node_name"},
-	)
-	latencyGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{Name: "pso_node_latency_ms", Help: "Latensi komunikasi ke node (ms)"},
-		[]string{"node_name"},
-	)
-
-	registerMetricsOnce sync.Once
-)
-
-func init() {
-	registerMetricsOnce.Do(func() {
-		prometheus.MustRegister(cpuGauge)
-		prometheus.MustRegister(latencyGauge)
-	})
-}
-
-func StartCollector(nodes []*lbtypes.BackendNode, client *http.Client, interval time.Duration, paramProfile string) {
-	if client == nil || len(nodes) == 0 {
+func StartCollector(nodes []*lbtypes.BackendNode, _ time.Duration, paramProfile string) {
+	if len(nodes) == 0 {
 		return
 	}
-	if interval <= 0 {
-		interval = 250 * time.Millisecond
-	}
 
-	updateAllMetrics(nodes, client, paramProfile)
-	ticker := time.NewTicker(interval)
-	for range ticker.C {
+	client := &http.Client{Timeout: 1200 * time.Millisecond}
+	go func() {
+		ticker := time.NewTicker(metricsCollectInterval)
+		defer ticker.Stop()
+
 		updateAllMetrics(nodes, client, paramProfile)
-	}
+		for range ticker.C {
+			updateAllMetrics(nodes, client, paramProfile)
+		}
+	}()
 }
 
 func updateAllMetrics(nodes []*lbtypes.BackendNode, client *http.Client, paramProfile string) {
@@ -66,64 +43,50 @@ func updateAllMetrics(nodes []*lbtypes.BackendNode, client *http.Client, paramPr
 		wg.Add(1)
 		go func(n *lbtypes.BackendNode) {
 			defer wg.Done()
-			getRealNodeMetrics(n, client, paramProfile)
+			collectNodeCPUMetric(n, client, paramProfile)
 		}(node)
 	}
 	wg.Wait()
 }
 
-func getRealNodeMetrics(node *lbtypes.BackendNode, client *http.Client, paramProfile string) {
-	if node == nil || node.URL == nil {
+func collectNodeCPUMetric(node *lbtypes.BackendNode, client *http.Client, paramProfile string) {
+	if node == nil || node.URL == nil || client == nil {
 		return
 	}
-	metricsURL := node.URL.String() + "/metrics"
-	startTime := time.Now()
 
-	resp, err := client.Get(metricsURL)
-	responseTime := time.Since(startTime).Seconds() * 1000
+	telemetryURL := strings.TrimRight(node.URL.String(), "/") + "/telemetry/cpu"
+	resp, err := client.Get(telemetryURL)
 	if err != nil {
-		log.Printf("[METRIC][SRC=%s] Gagal mengambil metrik dari %s: %v\n", activeParamProfile(paramProfile), node.Name, err)
-		proxy.ApplyMetricPenalty(node)
+		log.Printf("[METRIC][SRC=%s] Gagal ambil telemetry CPU dari %s: %v", activeParamProfile(paramProfile), node.Name, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("[METRIC][SRC=%s] Gagal membaca body dari %s: %v\n", activeParamProfile(paramProfile), node.Name, err)
-		proxy.ApplyMetricPenalty(node)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[METRIC][SRC=%s] Telemetry CPU %s mengembalikan status=%d", activeParamProfile(paramProfile), node.Name, resp.StatusCode)
 		return
 	}
 
-	var parsed NodeMetrics
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		log.Printf("[METRIC][SRC=%s] Gagal parse JSON dari %s: %v\n", activeParamProfile(paramProfile), node.Name, err)
-		proxy.ApplyMetricPenalty(node)
+	var payload cpuTelemetryPayload
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		log.Printf("[METRIC][SRC=%s] Gagal decode telemetry CPU %s: %v", activeParamProfile(paramProfile), node.Name, err)
 		return
 	}
 
-	normalizedCPU := parsed.CPUUsageNormalized
-	if normalizedCPU < 0 {
-		normalizedCPU = 0
+	cpuPct := payload.CPUPercent
+	if cpuPct < 0 {
+		cpuPct = 0
 	}
-	if normalizedCPU > 100 {
-		normalizedCPU = 100
-	}
-
-	responseMS := responseTime
-	if parsed.RequestLatencyMS > 0 {
-		responseMS = parsed.RequestLatencyMS
+	if cpuPct > 100 {
+		cpuPct = 100
 	}
 
-	node.UpdateMetrics(
-		normalizedCPU,
-		parsed.InflightRequests,
-		responseMS,
-		100,
-	)
+	nodeSnapshot := node.SnapshotForDecision()
+	node.UpdateCPU(cpuPct, nodeSnapshot.CPUCap)
+	normalizedCPU := lbtypes.CalculateNormalizedCPU(cpuPct, nodeSnapshot.CPUCap)
 
-	cpuGauge.WithLabelValues(node.Name).Set(normalizedCPU)
-	latencyGauge.WithLabelValues(node.Name).Set(responseMS)
+	labelNode := NodeLabel(node.Name)
+	SetFuzzyInputCPU(labelNode, normalizedCPU)
 }
 
 func activeParamProfile(profile string) string {

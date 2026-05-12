@@ -28,8 +28,9 @@ func (s *baseFuzzyStrategy) SelectNode(nodes []lbtypes.BackendNode, snapshot *lb
 	totalScore := 0.0
 
 	for i := range nodes {
+		normalizedCPU := lbtypes.CalculateNormalizedCPU(nodes[i].CPU, nodes[i].CPUCap)
 		score := s.engine.CalculateMamdani(NodeMetrics{
-			CPU:         nodes[i].CPU,
+			CPU:         normalizedCPU,
 			QueueLength: nodes[i].Queue,
 			RespTime:    nodes[i].RespMS,
 		}, s.rules)
@@ -38,9 +39,11 @@ func (s *baseFuzzyStrategy) SelectNode(nodes []lbtypes.BackendNode, snapshot *lb
 		}
 		totalScore += score
 		if i == 0 {
+			snapshot.CPU1Normalized = normalizedCPU
 			snapshot.Score1 = score
 		}
 		if i == 1 {
+			snapshot.CPU2Normalized = normalizedCPU
 			snapshot.Score2 = score
 		}
 		if score > bestScore {

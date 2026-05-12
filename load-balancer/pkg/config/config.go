@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,9 @@ const (
 
 	TrafficLogModeWindow = "window"
 	TrafficLogModePerHit = "per_hit"
+
+	defaultNode1CPUCapacity = 100.0
+	defaultNode2CPUCapacity = 50.0
 )
 
 var DefaultBaseFuzzyParams = []float64{
@@ -90,7 +94,7 @@ func Load() (RuntimeConfig, error) {
 	return RuntimeConfig{
 		Algorithm:              algorithm,
 		TrafficLogMode:         trafficLogMode,
-		MetricsInterval:        envDurationMS("METRICS_INTERVAL", 100*time.Millisecond),
+		MetricsInterval:        envDurationMS("METRICS_INTERVAL", 50*time.Millisecond),
 		AlgoLogInterval:        envDurationMS("ALGO_STATUS_LOG_INTERVAL", 30*time.Second),
 		ListenAddr:             ":8080",
 		BackendNodes:           backendNodes,
@@ -162,9 +166,53 @@ func initBackendNodes(backendDNS []string) ([]*lbtypes.BackendNode, error) {
 			return nil, fmt.Errorf("gagal mem-parse URL backend %q: %w", dns, err)
 		}
 		nodeName := fmt.Sprintf("api-node%d", i+1)
-		nodes = append(nodes, &lbtypes.BackendNode{Name: nodeName, URL: backendURL, CPUCap: 100})
+		cpuCap := resolveNodeCPUCapacity(i, nodeName)
+		nodes = append(nodes, &lbtypes.BackendNode{Name: nodeName, URL: backendURL, CPUCap: cpuCap})
 	}
 	return nodes, nil
+}
+
+func resolveNodeCPUCapacity(index int, nodeName string) float64 {
+	defaultCap := defaultCPUCapacityForIndex(index)
+	candidates := []string{
+		fmt.Sprintf("NODE%d_CPU_LIMIT_PERCENT", index+1),
+		fmt.Sprintf("%s_CPU_LIMIT_PERCENT", strings.ToUpper(strings.ReplaceAll(nodeName, "-", "_"))),
+	}
+	for _, key := range candidates {
+		if value, ok := readCPUCapacityEnv(key); ok {
+			return value
+		}
+	}
+	// Fallback kompatibilitas: CPU_LIMIT_PERCENT tunggal dipakai untuk node1.
+	if index == 0 {
+		if value, ok := readCPUCapacityEnv("CPU_LIMIT_PERCENT"); ok {
+			return value
+		}
+	}
+	return defaultCap
+}
+
+func defaultCPUCapacityForIndex(index int) float64 {
+	switch index {
+	case 1:
+		return defaultNode2CPUCapacity
+	default:
+		return defaultNode1CPUCapacity
+	}
+}
+
+func readCPUCapacityEnv(key string) (float64, bool) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return 0, false
+	}
+	raw = strings.TrimSuffix(raw, "%")
+	value, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil || value <= 0 {
+		log.Printf("[WARNING] %s=%q tidak valid. Lewati override CPU capacity.", key, raw)
+		return 0, false
+	}
+	return value, true
 }
 
 func initializeFuzzyEngines(algorithm string) FuzzyBootstrap {

@@ -10,62 +10,26 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/shirou/gopsutil/v3/process"
+	"github.com/shirou/gopsutil/v3/cpu"
 )
 
 var nodeName string
 var hostName string
-var myProcess *process.Process
-var (
-	inflightRequests   atomic.Int64
-	requestLatencyLast atomic.Uint64
-	cpuSampleMu        sync.Mutex
-)
-
-var (
-	apiRequestTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "api_http_requests_total",
-			Help: "Total request HTTP per replica API",
-		},
-		[]string{"backend_server", "node_name", "method", "path", "status"},
-	)
-	apiRequestDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "api_http_request_duration_seconds",
-			Help:    "Durasi request HTTP per replica API",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"backend_server", "node_name", "method", "path", "status"},
-	)
-)
+var telemetryState = struct {
+	mu         sync.RWMutex
+	cpuPercent float64
+}{}
 
 func init() {
-	prometheus.MustRegister(apiRequestTotal)
-	prometheus.MustRegister(apiRequestDuration)
-
 	var err error
 	hostName, err = os.Hostname()
 	if err != nil || strings.TrimSpace(hostName) == "" {
 		hostName = "unknown-host"
-	}
-
-	myProcess, err = process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		log.Printf("[WARNING] Gagal inisialisasi pembaca metrik Container: %v", err)
-	}
-
-	if myProcess != nil {
-		myProcess.Percent(0)
 	}
 }
 
@@ -76,61 +40,52 @@ type ResponseData struct {
 	RequestIP string `json:"request_ip"`
 }
 
-type NodeMetrics struct {
-	NodeName           string  `json:"node_name"`
-	CPUUsageNormalized float64 `json:"cpu_usage_normalized"`
-	RequestLatencyMS   float64 `json:"request_latency_ms"`
-	InflightRequests   float64 `json:"inflight_requests"`
+type CPUTelemetryResponse struct {
+	NodeName      string  `json:"node_name"`
+	CPUPercent    float64 `json:"cpu_percent"`
+	SampledAtUnix int64   `json:"sampled_at_unix"`
 }
 
-func loadRequestLatencyLast() float64 {
-	return math.Float64frombits(requestLatencyLast.Load())
+func startCPUTelemetrySampler() {
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			percentages, err := cpu.Percent(0, false)
+			if err != nil || len(percentages) == 0 {
+				continue
+			}
+			v := percentages[0]
+			if v < 0 {
+				v = 0
+			}
+			if v > 100 {
+				v = 100
+			}
+			telemetryState.mu.Lock()
+			telemetryState.cpuPercent = v
+			telemetryState.mu.Unlock()
+		}
+	}()
 }
 
-func storeRequestLatencyLast(sampleMS float64) {
-	if sampleMS <= 0 {
+func cpuTelemetryHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Gunakan method GET", http.StatusMethodNotAllowed)
 		return
 	}
-	requestLatencyLast.Store(math.Float64bits(sampleMS))
-}
-
-func instantaneousNormalizedCPU() float64 {
-	if myProcess == nil {
-		return 0
-	}
-
-	cpuSampleMu.Lock()
-	rawCPU, err := myProcess.Percent(0)
-	cpuSampleMu.Unlock()
-	if err != nil {
-		return 0
-	}
-
-	cores := float64(runtime.NumCPU())
-	if cores <= 0 {
-		cores = 1
-	}
-
-	normalized := rawCPU / cores
-	if normalized < 0 {
-		return 0
-	}
-	if normalized > 100 {
-		return 100
-	}
-	return normalized
-}
-
-func metricsJSONHandler(w http.ResponseWriter, r *http.Request, name string) {
-	metrics := NodeMetrics{
-		NodeName:           name,
-		CPUUsageNormalized: instantaneousNormalizedCPU(),
-		RequestLatencyMS:   loadRequestLatencyLast(),
-		InflightRequests:   float64(inflightRequests.Load()),
-	}
+	telemetryState.mu.RLock()
+	cpuPercent := telemetryState.cpuPercent
+	telemetryState.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(metrics)
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(CPUTelemetryResponse{
+		NodeName:      nodeName,
+		CPUPercent:    cpuPercent,
+		SampledAtUnix: time.Now().Unix(),
+	})
 }
 
 func dataProcessHandler(w http.ResponseWriter, r *http.Request) {
@@ -281,21 +236,13 @@ func withBackendHeader(next http.Handler) http.Handler {
 	})
 }
 
-func withPrometheus(next http.Handler) http.Handler {
+func withAccessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		inflightRequests.Add(1)
-		defer inflightRequests.Add(-1)
-
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
-		durationSeconds := time.Since(start).Seconds()
-		durationMS := durationSeconds * 1000.0
 
-		statusStr := strconv.Itoa(rec.status)
-		labels := []string{hostName, nodeName, r.Method, r.URL.Path, statusStr}
-		apiRequestTotal.WithLabelValues(labels...).Inc()
-		apiRequestDuration.WithLabelValues(labels...).Observe(durationSeconds)
+		durationMS := float64(time.Since(start).Microseconds()) / 1000.0
 		fullPath := r.URL.Path
 		if r.URL.RawQuery != "" {
 			fullPath += "?" + r.URL.RawQuery
@@ -312,11 +259,6 @@ func withPrometheus(next http.Handler) http.Handler {
 			r.RemoteAddr,
 			r.UserAgent(),
 		)
-
-		// Endpoint metrik tidak dipakai sebagai sinyal latency bisnis.
-		if r.URL.Path != "/metrics" && r.URL.Path != "/metrics/prometheus" {
-			storeRequestLatencyLast(durationMS)
-		}
 	})
 }
 
@@ -331,6 +273,7 @@ func main() {
 	nName := flag.String("name", "API-NODE-UNKNOWN", "Nama unik untuk instance API node ini")
 	flag.Parse()
 	nodeName = *nName
+	startCPUTelemetrySampler()
 
 	port := "8080"
 	log.Printf("Starting API Service di port %s dengan nama: %s (hostname: %s)\n", port, nodeName, hostName)
@@ -353,21 +296,14 @@ func main() {
 		_ = json.NewEncoder(w).Encode(data)
 	})
 
-	// Endpoint JSON internal untuk load-balancer collector.
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		metricsJSONHandler(w, r, nodeName)
-	})
-
-	// Endpoint Prometheus untuk observability per replika.
-	mux.Handle("/metrics/prometheus", promhttp.Handler())
-
 	mux.HandleFunc("/process", dataProcessHandler)
 	mux.HandleFunc("/write", dataProcessHandler)
 	mux.HandleFunc("/fetch", dataFetchHandler)
 	mux.HandleFunc("/read", dataFetchHandler)
 	mux.HandleFunc("/api/stress-test", stressTestHandler)
+	mux.HandleFunc("/telemetry/cpu", cpuTelemetryHandler)
 
-	handler := chain(mux, withBackendHeader, withPrometheus)
+	handler := chain(mux, withBackendHeader, withAccessLog)
 
 	server := &http.Server{
 		Addr:         ":" + port,

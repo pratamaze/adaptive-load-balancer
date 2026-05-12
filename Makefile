@@ -200,7 +200,7 @@ reset-swarm:
 	@echo "Swarm services have been force-updated and stabilized."
 
 prep-fuzzy:
-	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGO --env-add LB_ALGO=fuzzy --env-rm FUZZY_PARAM_SOURCE --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --env-add FUZZY_PARAM_SOURCE=base --env-add TRAFFIC_LOG_MODE=per_hit --label-add $(LB_MODE_LABEL_KEY)=fuzzy-base $(LB_SERVICE)"
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGO --env-add LB_ALGO=fuzzy --env-rm FUZZY_PARAM_SOURCE --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=100ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --env-add FUZZY_PARAM_SOURCE=base --env-add TRAFFIC_LOG_MODE=per_hit --label-add $(LB_MODE_LABEL_KEY)=fuzzy-base $(LB_SERVICE)"
 	@$(MAKE) reset-swarm
 	@$(MAKE) verify-fuzzy
 

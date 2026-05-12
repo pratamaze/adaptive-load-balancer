@@ -6,22 +6,20 @@ import (
 	"log"
 	"net/http"
 	"net/http/httputil"
-	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"load-balancer/pkg/algorithm/roundrobin"
+	"load-balancer/pkg/metrics"
 	lbtypes "load-balancer/pkg/types"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const selectedNodeTraceHeader = "X-LB-Selected-Node"
-const requestStartTraceHeader = "X-LB-Request-Start-UnixNano"
 const decisionAuditLogEnabled = true
+const responseEMAAlpha = 0.2
 
-type decisionSnapshotContextKey struct{}
+type backendNodeContextKey struct{}
 
 type LBProxyConfig struct {
 	Nodes             []*lbtypes.BackendNode
@@ -46,6 +44,9 @@ type LBProxy struct {
 
 	reverseProxy *httputil.ReverseProxy
 	mux          *http.ServeMux
+
+	rtMu     sync.RWMutex
+	rtEMAByN map[string]float64
 }
 
 func NewLBProxy(cfg LBProxyConfig) *LBProxy {
@@ -61,6 +62,16 @@ func NewLBProxy(cfg LBProxyConfig) *LBProxy {
 	}
 	if lb.activeStrategy == nil {
 		lb.activeStrategy = roundrobin.NewRoundRobinStrategy()
+	}
+	lb.rtEMAByN = make(map[string]float64, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		if n == nil {
+			continue
+		}
+		s := n.SnapshotForDecision()
+		if s.RespMS > 0 {
+			lb.rtEMAByN[n.Name] = s.RespMS
+		}
 	}
 	lb.reverseProxy = lb.newReverseProxy()
 	lb.mux = lb.newHTTPMux()
@@ -80,11 +91,16 @@ func (p *LBProxy) selectBackend() (*lbtypes.BackendNode, *lbtypes.DecisionSnapsh
 	if len(p.nodes) == 0 {
 		return nil, nil
 	}
-
 	decisionTag := strings.ToUpper(p.algorithm)
 	nodeSnapshots := make([]lbtypes.BackendNode, 0, len(p.nodes))
 	for _, node := range p.nodes {
+		if node == nil {
+			continue
+		}
 		nodeSnapshots = append(nodeSnapshots, node.SnapshotForDecision())
+	}
+	if len(nodeSnapshots) == 0 {
+		return nil, nil
 	}
 
 	decisionSnapshot := newDecisionSnapshot(nodeSnapshots, decisionTag)
@@ -95,15 +111,30 @@ func (p *LBProxy) selectBackend() (*lbtypes.BackendNode, *lbtypes.DecisionSnapsh
 			decisionSnapshot.DecisionTag = "ROUND_ROBIN_FALLBACK"
 		}
 	}
-	selectedRuntimeNode := (*lbtypes.BackendNode)(nil)
-	if selectedNode != nil {
-		selectedRuntimeNode = p.nodeByName(selectedNode.Name)
+	if selectedNode == nil {
+		return nil, decisionSnapshot
 	}
-	if selectedNode != nil && selectedRuntimeNode != nil && decisionSnapshot != nil {
+	if decisionSnapshot != nil {
 		assignDecisionFallback(decisionSnapshot, selectedNode, decisionTag)
+		if strings.TrimSpace(decisionSnapshot.Node1Name) != "" {
+			metrics.SetFuzzyOutputScore(metrics.NodeLabel(decisionSnapshot.Node1Name), decisionSnapshot.Score1)
+		}
+		if strings.TrimSpace(decisionSnapshot.Node2Name) != "" {
+			metrics.SetFuzzyOutputScore(metrics.NodeLabel(decisionSnapshot.Node2Name), decisionSnapshot.Score2)
+		}
 	}
 	emitDecisionAudit(decisionSnapshot)
-	return selectedRuntimeNode, decisionSnapshot
+	p.enqueueDecisionSnapshot(decisionSnapshot)
+	nodeRef := p.nodeByName(selectedNode.Name)
+	if nodeRef != nil {
+		return nodeRef, decisionSnapshot
+	}
+	for _, n := range p.nodes {
+		if n != nil {
+			return n, decisionSnapshot
+		}
+	}
+	return nil, decisionSnapshot
 }
 
 func (p *LBProxy) enqueueDecisionSnapshot(snapshot *lbtypes.DecisionSnapshot) {
@@ -130,46 +161,24 @@ func (p *LBProxy) newReverseProxy() *httputil.ReverseProxy {
 	proxy := &httputil.ReverseProxy{
 		Transport: customTransport,
 		Director: func(req *http.Request) {
-			backendNode, decisionSnapshot := p.selectBackend()
+			backendNode := backendNodeFromContext(req.Context())
 			if backendNode == nil {
 				log.Println("Gagal memilih backend, tidak ada node tersedia.")
 				return
 			}
 
-			atomic.AddInt64(&backendNode.ProxyInflight, 1)
-			backendNode.RequestCount.Add(1)
-			p.enqueueDecisionSnapshot(decisionSnapshot)
 			originalHost := req.Host
 			req.URL.Scheme = backendNode.URL.Scheme
 			req.URL.Host = backendNode.URL.Host
-			*req = *req.WithContext(withDecisionSnapshot(req.Context(), decisionSnapshot))
 			req.Header.Set(selectedNodeTraceHeader, backendNode.Name)
-			req.Header.Set(requestStartTraceHeader, strconv.FormatInt(time.Now().UnixNano(), 10))
 			req.Header.Set("X-Forwarded-Host", originalHost)
 			req.Host = originalHost
-		},
-		ModifyResponse: func(res *http.Response) error {
-			if res == nil || res.Request == nil || res.Request.URL == nil {
-				return nil
-			}
-			selectedNode := strings.TrimSpace(res.Request.Header.Get(selectedNodeTraceHeader))
-			if selectedNode == "" {
-				selectedNode = p.nodeNameByHost(res.Request.URL.Host)
-			}
-			latencyMS := requestLatencyMSFromTraceHeader(res.Request)
-			if node := p.nodeByName(selectedNode); node != nil && latencyMS > 0 {
-				node.SetLastProxyLatencyMS(latencyMS)
-			}
-			p.finalizeProxyRequest(selectedNode, 0)
-			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			selectedNode := strings.TrimSpace(r.Header.Get(selectedNodeTraceHeader))
 			if selectedNode == "" && r.URL != nil {
 				selectedNode = p.nodeNameByHost(r.URL.Host)
 			}
-			latencyMS := requestLatencyMSFromTraceHeader(r)
-			p.finalizeProxyRequest(selectedNode, latencyMS)
 			targetHost := "unknown-host"
 			path := ""
 			if r.URL != nil {
@@ -193,20 +202,6 @@ func (p *LBProxy) newReverseProxy() *httputil.ReverseProxy {
 		},
 	}
 	return proxy
-}
-
-func (p *LBProxy) finalizeProxyRequest(selectedNode string, latencyMS float64) {
-	node := p.nodeByName(selectedNode)
-	if node == nil {
-		return
-	}
-	next := atomic.AddInt64(&node.ProxyInflight, -1)
-	if next < 0 {
-		atomic.StoreInt64(&node.ProxyInflight, 0)
-	}
-	if latencyMS > 0 {
-		node.SetLastProxyLatencyMS(latencyMS)
-	}
 }
 
 func (p *LBProxy) nodeNameByHost(host string) string {
@@ -288,47 +283,78 @@ func (p *LBProxy) startAlgoStatusLogger(interval time.Duration) {
 
 func (p *LBProxy) newHTTPMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/lb/runtime", p.statusHTTPHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/metrics" {
-			promhttp.Handler().ServeHTTP(w, r)
-			return
-		}
 		if r.URL.Path == "/lb/runtime" {
 			p.statusHTTPHandler(w, r)
 			return
 		}
-		p.reverseProxy.ServeHTTP(w, r)
+		p.proxyHTTPHandler(w, r)
 	})
 	return mux
 }
 
-func requestLatencyMSFromTraceHeader(req *http.Request) float64 {
-	if req == nil {
-		return 0
-	}
-	raw := strings.TrimSpace(req.Header.Get(requestStartTraceHeader))
-	if raw == "" {
-		return 0
-	}
-	startUnixNano, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || startUnixNano <= 0 {
-		return 0
-	}
-	startTime := time.Unix(0, startUnixNano)
-	elapsed := time.Since(startTime).Seconds() * 1000.0
-	if elapsed <= 0 {
-		return 0
-	}
-	return elapsed
-}
-
-func withDecisionSnapshot(ctx context.Context, snapshot *lbtypes.DecisionSnapshot) context.Context {
-	if snapshot == nil {
+func withBackendNode(ctx context.Context, node *lbtypes.BackendNode) context.Context {
+	if node == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, decisionSnapshotContextKey{}, snapshot)
+	return context.WithValue(ctx, backendNodeContextKey{}, node)
+}
+
+func backendNodeFromContext(ctx context.Context) *lbtypes.BackendNode {
+	if ctx == nil {
+		return nil
+	}
+	node, ok := ctx.Value(backendNodeContextKey{}).(*lbtypes.BackendNode)
+	if !ok {
+		return nil
+	}
+	return node
+}
+
+func (p *LBProxy) proxyHTTPHandler(w http.ResponseWriter, r *http.Request) {
+	backendNode, _ := p.selectBackend()
+	if backendNode == nil || backendNode.URL == nil {
+		http.Error(w, "Service tidak tersedia", http.StatusServiceUnavailable)
+		return
+	}
+
+	backendNode.ProxyInflight.Add(1)
+	metrics.SetFuzzyInputInflight(metrics.NodeLabel(backendNode.Name), float64(backendNode.ProxyInflight.Load()))
+	backendNode.RequestCount.Add(1)
+	start := time.Now()
+	defer func() {
+		next := backendNode.ProxyInflight.Add(-1)
+		if next < 0 {
+			backendNode.ProxyInflight.Store(0)
+			next = 0
+		}
+		metrics.SetFuzzyInputInflight(metrics.NodeLabel(backendNode.Name), float64(next))
+		rtMs := time.Since(start).Milliseconds()
+		if rtMs > 0 {
+			p.updateResponseEMA(backendNode, float64(rtMs))
+		}
+	}()
+
+	r = r.WithContext(withBackendNode(r.Context(), backendNode))
+	p.reverseProxy.ServeHTTP(w, r)
+}
+
+func (p *LBProxy) updateResponseEMA(node *lbtypes.BackendNode, sampleMS float64) {
+	if node == nil || sampleMS <= 0 {
+		return
+	}
+	p.rtMu.Lock()
+	prev := p.rtEMAByN[node.Name]
+	if prev <= 0 {
+		prev = sampleMS
+	}
+	next := (responseEMAAlpha * sampleMS) + ((1 - responseEMAAlpha) * prev)
+	p.rtEMAByN[node.Name] = next
+	p.rtMu.Unlock()
+	node.UpdateResponseMS(next)
+	node.SetLastProxyLatencyMS(next)
+	metrics.SetFuzzyInputRTEma(metrics.NodeLabel(node.Name), next)
 }
 
 func newDecisionSnapshot(nodes []lbtypes.BackendNode, decisionTag string) *lbtypes.DecisionSnapshot {
@@ -345,19 +371,21 @@ func newDecisionSnapshot(nodes []lbtypes.BackendNode, decisionTag string) *lbtyp
 		n1 := out.NodeSnapshots[0]
 		out.Node1Name = n1.Name
 		out.CPU1 = n1.CPU
+		out.CPU1Normalized = lbtypes.CalculateNormalizedCPU(n1.CPU, n1.CPUCap)
 		out.Q1 = n1.Queue
 		out.RT1 = n1.RespMS
 		out.Node1CPUCap = n1.CPUCap
-		out.Node1BackendQ = n1.Inflight
+		out.Node1BackendQ = n1.Queue
 	}
 	if len(out.NodeSnapshots) > 1 {
 		n2 := out.NodeSnapshots[1]
 		out.Node2Name = n2.Name
 		out.CPU2 = n2.CPU
+		out.CPU2Normalized = lbtypes.CalculateNormalizedCPU(n2.CPU, n2.CPUCap)
 		out.Q2 = n2.Queue
 		out.RT2 = n2.RespMS
 		out.Node2CPUCap = n2.CPUCap
-		out.Node2BackendQ = n2.Inflight
+		out.Node2BackendQ = n2.Queue
 	}
 	return out
 }

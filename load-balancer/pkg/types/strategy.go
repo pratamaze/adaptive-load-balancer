@@ -20,14 +20,14 @@ type BackendNode struct {
 	Inflight float64
 
 	RequestCount  atomic.Int64 `json:"-"`
-	ProxyInflight int64        `json:"-"`
+	ProxyInflight atomic.Int64 `json:"-"`
 
 	lastProxyLatencyBit atomic.Uint64
 	mu                  sync.RWMutex
 }
 
 func (n *BackendNode) SnapshotForDecision() BackendNode {
-	queue := float64(atomic.LoadInt64(&n.ProxyInflight))
+	queue := float64(n.ProxyInflight.Load())
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return BackendNode{
@@ -49,6 +49,24 @@ func (n *BackendNode) UpdateMetrics(cpu, inflight, responseMS, cpuCap float64) {
 	n.CPUCap = cpuCap
 }
 
+func (n *BackendNode) UpdateCPU(cpu, cpuCap float64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.CPU = cpu
+	if cpuCap > 0 {
+		n.CPUCap = cpuCap
+	}
+}
+
+func (n *BackendNode) UpdateResponseMS(ms float64) {
+	if ms <= 0 {
+		return
+	}
+	n.mu.Lock()
+	n.RespMS = ms
+	n.mu.Unlock()
+}
+
 func (n *BackendNode) SetLastProxyLatencyMS(ms float64) {
 	if ms <= 0 {
 		return
@@ -67,6 +85,8 @@ type DecisionSnapshot struct {
 	Node2Name       string
 	CPU1            float64
 	CPU2            float64
+	CPU1Normalized  float64
+	CPU2Normalized  float64
 	Q1              float64
 	Q2              float64
 	RT1             float64

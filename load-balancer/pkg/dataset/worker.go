@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"load-balancer/pkg/config"
@@ -48,6 +47,20 @@ var fuzzyTrainingDataHeader = []string{
 	"os_idle_cpu",
 }
 
+type perSecondAggregate struct {
+	node1Name string
+	node2Name string
+
+	node1Req int64
+	node2Req int64
+
+	score1Sum float64
+	score2Sum float64
+	scoreN    int64
+
+	lastSnapshot *lbtypes.DecisionSnapshot
+}
+
 func NewSnapshotChannel(buffer int) chan *lbtypes.DecisionSnapshot {
 	if buffer <= 0 {
 		buffer = 2048
@@ -76,29 +89,130 @@ func StartWorker(csvPath string, snapshots <-chan *lbtypes.DecisionSnapshot, alg
 	}
 	defer file.Close()
 
-	log.Printf("[DATASET] Recorder fuzzy aktif ke file %s", csvPath)
+	log.Printf("[DATASET] Recorder fuzzy agregasi 1 detik aktif ke file %s", csvPath)
 
-	var mu sync.Mutex
-	for snapshot := range snapshots {
-		if snapshot == nil {
-			continue
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	agg := &perSecondAggregate{}
+
+	for {
+		select {
+		case snapshot, ok := <-snapshots:
+			if !ok {
+				flushAggregate(file, writer, agg)
+				return
+			}
+			accumulateSnapshot(agg, snapshot)
+		case <-ticker.C:
+			flushAggregate(file, writer, agg)
 		}
-		record, ok := buildPerHitRecord(snapshot)
-		if !ok {
-			continue
-		}
-		mu.Lock()
-		if _, err := writer.WriteString(strings.Join(record, ",") + "\n"); err != nil {
-			log.Printf("[DATASET] Gagal tulis record: %v", err)
-		}
-		if err := writer.Flush(); err != nil {
-			log.Printf("[DATASET] Gagal flush writer: %v", err)
-		}
-		if err := file.Sync(); err != nil {
-			log.Printf("[DATASET] Gagal sync file: %v", err)
-		}
-		mu.Unlock()
 	}
+}
+
+func accumulateSnapshot(agg *perSecondAggregate, snapshot *lbtypes.DecisionSnapshot) {
+	if agg == nil || snapshot == nil {
+		return
+	}
+
+	if strings.TrimSpace(snapshot.Node1Name) != "" {
+		agg.node1Name = snapshot.Node1Name
+	}
+	if strings.TrimSpace(snapshot.Node2Name) != "" {
+		agg.node2Name = snapshot.Node2Name
+	}
+
+	selected := strings.TrimSpace(snapshot.SelectedNode)
+	switch selected {
+	case agg.node1Name:
+		agg.node1Req++
+	case agg.node2Name:
+		agg.node2Req++
+	}
+
+	agg.score1Sum += snapshot.Score1
+	agg.score2Sum += snapshot.Score2
+	agg.scoreN++
+
+	cp := *snapshot
+	agg.lastSnapshot = &cp
+}
+
+func flushAggregate(file *os.File, writer *bufio.Writer, agg *perSecondAggregate) {
+	if agg == nil || writer == nil || file == nil {
+		return
+	}
+	if strings.TrimSpace(agg.node1Name) == "" || strings.TrimSpace(agg.node2Name) == "" || agg.lastSnapshot == nil {
+		return
+	}
+
+	avgScore1 := 0.0
+	avgScore2 := 0.0
+	if agg.scoreN > 0 {
+		denom := float64(agg.scoreN)
+		avgScore1 = agg.score1Sum / denom
+		avgScore2 = agg.score2Sum / denom
+	}
+
+	s := agg.lastSnapshot
+	cpuCap1 := s.Node1CPUCap
+	cpuCap2 := s.Node2CPUCap
+	if cpuCap1 <= 0 {
+		cpuCap1 = 100
+	}
+	if cpuCap2 <= 0 {
+		cpuCap2 = 100
+	}
+
+	totalReq := agg.node1Req + agg.node2Req
+	record := []string{
+		time.Now().UTC().Format(time.RFC3339Nano),
+		"1000",
+		config.TrafficLogModePerHit,
+		cpuUsageUnitRaw,
+		agg.node1Name,
+		agg.node2Name,
+		strconv.FormatInt(agg.node1Req, 10),
+		strconv.FormatInt(agg.node2Req, 10),
+		strconv.FormatInt(totalReq, 10),
+		// Kolom raw dipertahankan untuk kompatibilitas dataset historis.
+		formatFloatCSV(s.CPU1),
+		formatFloatCSV(s.CPU2),
+		formatFloatCSV(s.CPU1Normalized),
+		formatFloatCSV(s.CPU2Normalized),
+		formatFloatCSV(cpuCap1),
+		formatFloatCSV(cpuCap2),
+		formatFloatCSV(s.Q1),
+		formatFloatCSV(s.Q2),
+		formatFloatCSV(s.Node1BackendQ),
+		formatFloatCSV(s.Node2BackendQ),
+		formatFloatCSV(s.Q1),
+		formatFloatCSV(s.Q2),
+		formatFloatCSV(s.RT1),
+		formatFloatCSV(s.RT2),
+		formatFloatCSV(avgScore1),
+		formatFloatCSV(avgScore2),
+		formatFloatCSV(osIdleCPU10),
+	}
+
+	if _, err := writer.WriteString(strings.Join(record, ",") + "\n"); err != nil {
+		log.Printf("[DATASET] Gagal tulis record agregasi: %v", err)
+		return
+	}
+	if err := writer.Flush(); err != nil {
+		log.Printf("[DATASET] Gagal flush writer: %v", err)
+		return
+	}
+	if err := file.Sync(); err != nil {
+		log.Printf("[DATASET] Gagal sync file: %v", err)
+		return
+	}
+
+	agg.node1Req = 0
+	agg.node2Req = 0
+	agg.score1Sum = 0
+	agg.score2Sum = 0
+	agg.scoreN = 0
 }
 
 func initCSV(csvPath string) (*os.File, *bufio.Writer, error) {
@@ -130,67 +244,6 @@ func initCSV(csvPath string) (*os.File, *bufio.Writer, error) {
 	}
 
 	return file, writer, nil
-}
-
-func buildPerHitRecord(snapshot *lbtypes.DecisionSnapshot) ([]string, bool) {
-	node1Name := snapshot.Node1Name
-	node2Name := snapshot.Node2Name
-	if strings.TrimSpace(node1Name) == "" || strings.TrimSpace(node2Name) == "" {
-		return nil, false
-	}
-
-	r1, r2 := int64(0), int64(0)
-	selectedNode := strings.TrimSpace(snapshot.SelectedNode)
-	switch selectedNode {
-	case node1Name:
-		r1 = 1
-	case node2Name:
-		r2 = 1
-	default:
-		return nil, false
-	}
-
-	cpuCap1 := snapshot.Node1CPUCap
-	cpuCap2 := snapshot.Node2CPUCap
-	if cpuCap1 <= 0 {
-		cpuCap1 = 100
-	}
-	if cpuCap2 <= 0 {
-		cpuCap2 = 100
-	}
-
-	record := []string{
-		time.Now().UTC().Format(time.RFC3339Nano),
-		"0",
-		config.TrafficLogModePerHit,
-		cpuUsageUnitRaw,
-		node1Name,
-		node2Name,
-		strconv.FormatInt(r1, 10),
-		strconv.FormatInt(r2, 10),
-		strconv.FormatInt(r1+r2, 10),
-		// Kolom raw dipertahankan untuk kompatibilitas dataset historis;
-		// runtime kini hanya menyimpan CPU normalized.
-		formatFloatCSV(snapshot.CPU1),
-		formatFloatCSV(snapshot.CPU2),
-		formatFloatCSV(snapshot.CPU1),
-		formatFloatCSV(snapshot.CPU2),
-		formatFloatCSV(cpuCap1),
-		formatFloatCSV(cpuCap2),
-		formatFloatCSV(snapshot.Q1),
-		formatFloatCSV(snapshot.Q2),
-		formatFloatCSV(snapshot.Node1BackendQ),
-		formatFloatCSV(snapshot.Node2BackendQ),
-		formatFloatCSV(snapshot.Q1),
-		formatFloatCSV(snapshot.Q2),
-		formatFloatCSV(snapshot.RT1),
-		formatFloatCSV(snapshot.RT2),
-		formatFloatCSV(snapshot.Score1),
-		formatFloatCSV(snapshot.Score2),
-		formatFloatCSV(osIdleCPU10),
-	}
-
-	return record, true
 }
 
 func formatFloatCSV(value float64) string {
