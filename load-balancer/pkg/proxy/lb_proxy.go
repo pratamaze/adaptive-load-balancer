@@ -17,7 +17,12 @@ import (
 
 const selectedNodeTraceHeader = "X-LB-Selected-Node"
 const decisionAuditLogEnabled = true
-const responseEMAAlpha = 0.2
+
+var firstRequestObservedOnce sync.Once
+
+type nodeTelemetry struct {
+	observedRTMS float64
+}
 
 type backendNodeContextKey struct{}
 
@@ -45,8 +50,12 @@ type LBProxy struct {
 	reverseProxy *httputil.ReverseProxy
 	mux          *http.ServeMux
 
-	rtMu     sync.RWMutex
-	rtEMAByN map[string]float64
+	selectMu      sync.Mutex
+	telemetryMu   sync.RWMutex
+	nodeTelemetry map[string]nodeTelemetry
+
+	cpuStaleAfter  time.Duration
+	cpuDecayWindow time.Duration
 }
 
 func NewLBProxy(cfg LBProxyConfig) *LBProxy {
@@ -63,15 +72,19 @@ func NewLBProxy(cfg LBProxyConfig) *LBProxy {
 	if lb.activeStrategy == nil {
 		lb.activeStrategy = roundrobin.NewRoundRobinStrategy()
 	}
-	lb.rtEMAByN = make(map[string]float64, len(cfg.Nodes))
+	lb.nodeTelemetry = make(map[string]nodeTelemetry, len(cfg.Nodes))
+	lb.cpuStaleAfter = maxDuration(1500*time.Millisecond, cfg.MetricsEvery*3)
+	lb.cpuDecayWindow = maxDuration(6*time.Second, cfg.MetricsEvery*12)
 	for _, n := range cfg.Nodes {
 		if n == nil {
 			continue
 		}
+		telemetry := nodeTelemetry{}
 		s := n.SnapshotForDecision()
-		if s.RespMS > 0 {
-			lb.rtEMAByN[n.Name] = s.RespMS
+		if s.RespMS >= 0 {
+			telemetry.observedRTMS = s.RespMS
 		}
+		lb.nodeTelemetry[n.Name] = telemetry
 	}
 	lb.reverseProxy = lb.newReverseProxy()
 	lb.mux = lb.newHTTPMux()
@@ -92,21 +105,23 @@ func (p *LBProxy) selectBackend() (*lbtypes.BackendNode, *lbtypes.DecisionSnapsh
 		return nil, nil
 	}
 	decisionTag := strings.ToUpper(p.algorithm)
-	nodeSnapshots := make([]lbtypes.BackendNode, 0, len(p.nodes))
+	observedSnapshots := make([]lbtypes.BackendNode, 0, len(p.nodes))
 	for _, node := range p.nodes {
 		if node == nil {
 			continue
 		}
-		nodeSnapshots = append(nodeSnapshots, node.SnapshotForDecision())
+		observedSnapshots = append(observedSnapshots, node.SnapshotForDecision())
 	}
-	if len(nodeSnapshots) == 0 {
+	if len(observedSnapshots) == 0 {
 		return nil, nil
 	}
 
-	decisionSnapshot := newDecisionSnapshot(nodeSnapshots, decisionTag)
-	selectedNode := p.activeStrategy.SelectNode(nodeSnapshots, decisionSnapshot)
+	decisionNodes := p.applyDecisionFreshness(observedSnapshots)
+	p.publishDecisionInputs(decisionNodes)
+	decisionSnapshot := newDecisionSnapshot(observedSnapshots, decisionNodes, decisionTag)
+	selectedNode := p.activeStrategy.SelectNode(decisionNodes, decisionSnapshot)
 	if selectedNode == nil {
-		selectedNode = p.fallbackStrategy.SelectNode(nodeSnapshots, decisionSnapshot)
+		selectedNode = p.fallbackStrategy.SelectNode(decisionNodes, decisionSnapshot)
 		if decisionSnapshot != nil {
 			decisionSnapshot.DecisionTag = "ROUND_ROBIN_FALLBACK"
 		}
@@ -263,6 +278,46 @@ func (p *LBProxy) statusHTTPHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(p.runtimeStatus())
 }
 
+func (p *LBProxy) resetTelemetryHTTPHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Gunakan method POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	p.selectMu.Lock()
+	defer p.selectMu.Unlock()
+
+	p.telemetryMu.Lock()
+	for nodeName := range p.nodeTelemetry {
+		p.nodeTelemetry[nodeName] = nodeTelemetry{}
+	}
+	p.telemetryMu.Unlock()
+
+	resetNodes := 0
+	for _, node := range p.nodes {
+		if node == nil {
+			continue
+		}
+		node.ResetRuntimeState()
+		label := metrics.NodeLabel(node.Name)
+		metrics.SetFuzzyInputCPU(label, 0)
+		metrics.SetFuzzyInputRTEma(label, 0)
+		metrics.SetFuzzyInputInflight(label, 0)
+		metrics.SetFuzzyOutputScore(label, 0)
+		resetNodes++
+	}
+
+	log.Printf("[RUNTIME] Telemetry reset via /lb/reset-telemetry nodes=%d", resetNodes)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":        "ok",
+		"reset_nodes":   resetNodes,
+		"timestamp_utc": time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
 func (p *LBProxy) startAlgoStatusLogger(interval time.Duration) {
 	if interval <= 0 {
 		return
@@ -284,9 +339,14 @@ func (p *LBProxy) startAlgoStatusLogger(interval time.Duration) {
 func (p *LBProxy) newHTTPMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/lb/runtime", p.statusHTTPHandler)
+	mux.HandleFunc("/lb/reset-telemetry", p.resetTelemetryHTTPHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/lb/runtime" {
 			p.statusHTTPHandler(w, r)
+			return
+		}
+		if r.URL.Path == "/lb/reset-telemetry" {
+			p.resetTelemetryHTTPHandler(w, r)
 			return
 		}
 		p.proxyHTTPHandler(w, r)
@@ -313,79 +373,157 @@ func backendNodeFromContext(ctx context.Context) *lbtypes.BackendNode {
 }
 
 func (p *LBProxy) proxyHTTPHandler(w http.ResponseWriter, r *http.Request) {
+	firstRequestObservedOnce.Do(func() {
+		firstAt := time.Now().UTC()
+		log.Printf(
+			"[AUDIT][FIRST_REQUEST_IN] at=%s unix_ns=%d method=%s path=%s",
+			firstAt.Format(time.RFC3339Nano),
+			firstAt.UnixNano(),
+			r.Method,
+			r.URL.Path,
+		)
+	})
+
+	p.selectMu.Lock()
+	selectionLocked := true
+	defer func() {
+		if selectionLocked {
+			p.selectMu.Unlock()
+		}
+	}()
 	backendNode, _ := p.selectBackend()
 	if backendNode == nil || backendNode.URL == nil {
 		http.Error(w, "Service tidak tersedia", http.StatusServiceUnavailable)
 		return
 	}
 
-	backendNode.ProxyInflight.Add(1)
-	metrics.SetFuzzyInputInflight(metrics.NodeLabel(backendNode.Name), float64(backendNode.ProxyInflight.Load()))
-	backendNode.RequestCount.Add(1)
-	start := time.Now()
+	now := time.Now()
+	nextInflight := backendNode.ProxyInflight.Add(1)
+	start := now
+	nodeLabel := metrics.NodeLabel(backendNode.Name)
 	defer func() {
 		next := backendNode.ProxyInflight.Add(-1)
 		if next < 0 {
 			backendNode.ProxyInflight.Store(0)
 			next = 0
 		}
-		metrics.SetFuzzyInputInflight(metrics.NodeLabel(backendNode.Name), float64(next))
+		metrics.SetFuzzyInputInflight(nodeLabel, float64(next))
 		rtMs := time.Since(start).Milliseconds()
-		if rtMs > 0 {
-			p.updateResponseEMA(backendNode, float64(rtMs))
-		}
+		p.updateResponseRaw(backendNode, float64(rtMs))
 	}()
+	metrics.SetFuzzyInputInflight(nodeLabel, float64(nextInflight))
+	backendNode.RequestCount.Add(1)
+	selectionLocked = false
+	p.selectMu.Unlock()
 
 	r = r.WithContext(withBackendNode(r.Context(), backendNode))
 	p.reverseProxy.ServeHTTP(w, r)
 }
 
-func (p *LBProxy) updateResponseEMA(node *lbtypes.BackendNode, sampleMS float64) {
-	if node == nil || sampleMS <= 0 {
+func (p *LBProxy) updateResponseRaw(node *lbtypes.BackendNode, sampleMS float64) {
+	if node == nil || sampleMS < 0 {
 		return
 	}
-	p.rtMu.Lock()
-	prev := p.rtEMAByN[node.Name]
-	if prev <= 0 {
-		prev = sampleMS
-	}
-	next := (responseEMAAlpha * sampleMS) + ((1 - responseEMAAlpha) * prev)
-	p.rtEMAByN[node.Name] = next
-	p.rtMu.Unlock()
-	node.UpdateResponseMS(next)
-	node.SetLastProxyLatencyMS(next)
-	metrics.SetFuzzyInputRTEma(metrics.NodeLabel(node.Name), next)
+	p.telemetryMu.Lock()
+	state := p.nodeTelemetry[node.Name]
+	state.observedRTMS = sampleMS
+	p.nodeTelemetry[node.Name] = state
+	p.telemetryMu.Unlock()
+	node.UpdateResponseMS(sampleMS)
+	node.SetLastProxyLatencyMS(sampleMS)
+	metrics.SetFuzzyInputRTEma(metrics.NodeLabel(node.Name), sampleMS)
 }
 
-func newDecisionSnapshot(nodes []lbtypes.BackendNode, decisionTag string) *lbtypes.DecisionSnapshot {
-	if len(nodes) == 0 {
+func (p *LBProxy) applyDecisionFreshness(observed []lbtypes.BackendNode) []lbtypes.BackendNode {
+	now := time.Now()
+	out := make([]lbtypes.BackendNode, 0, len(observed))
+	for _, n := range observed {
+		adjusted := n
+		adjusted.CPU = p.decayCPUForDecision(n.Name, n.CPU, now)
+		adjusted.RespMS = p.decayRTForDecision(n.Name, n.RespMS, n.Queue, now)
+		out = append(out, adjusted)
+	}
+	return out
+}
+
+func (p *LBProxy) publishDecisionInputs(decisionNodes []lbtypes.BackendNode) {
+	for _, n := range decisionNodes {
+		label := metrics.NodeLabel(n.Name)
+		normalizedCPU := lbtypes.CalculateNormalizedCPU(n.CPU, n.CPUCap)
+		metrics.SetFuzzyInputCPU(label, normalizedCPU)
+		metrics.SetFuzzyInputRTEma(label, n.RespMS)
+	}
+}
+
+func (p *LBProxy) decayCPUForDecision(nodeName string, observedCPU float64, now time.Time) float64 {
+	node := p.nodeByName(nodeName)
+	if node == nil {
+		return clampCPU(observedCPU)
+	}
+	lastObserved := node.LastCPUObservedAt()
+	if lastObserved.IsZero() {
+		return clampCPU(observedCPU)
+	}
+	age := now.Sub(lastObserved)
+	decayed := decayToBaseline(observedCPU, 0.0, age, p.cpuStaleAfter, p.cpuDecayWindow)
+	return clampCPU(decayed)
+}
+
+func (p *LBProxy) decayRTForDecision(nodeName string, observedRT float64, inflight float64, now time.Time) float64 {
+	_ = now
+	if inflight <= 0 {
+		return 0
+	}
+
+	p.telemetryMu.RLock()
+	state, ok := p.nodeTelemetry[nodeName]
+	p.telemetryMu.RUnlock()
+	if ok {
+		observedRT = state.observedRTMS
+	}
+	if observedRT < 0 {
+		return 0
+	}
+	return observedRT
+}
+
+func newDecisionSnapshot(observedNodes, decisionNodes []lbtypes.BackendNode, decisionTag string) *lbtypes.DecisionSnapshot {
+	if len(decisionNodes) == 0 {
 		return nil
 	}
 	out := &lbtypes.DecisionSnapshot{
 		DecisionTag:     decisionTag,
 		RouletteValue:   -1,
 		DecisionTimeUTC: time.Now().UTC().Format(time.RFC3339Nano),
-		NodeSnapshots:   append([]lbtypes.BackendNode(nil), nodes...),
+		NodeSnapshots:   append([]lbtypes.BackendNode(nil), decisionNodes...),
 	}
-	if len(out.NodeSnapshots) > 0 {
-		n1 := out.NodeSnapshots[0]
+	if len(decisionNodes) > 0 {
+		n1 := decisionNodes[0]
+		o1 := n1
+		if len(observedNodes) > 0 {
+			o1 = observedNodes[0]
+		}
 		out.Node1Name = n1.Name
-		out.CPU1 = n1.CPU
+		out.CPU1 = o1.CPU
 		out.CPU1Normalized = lbtypes.CalculateNormalizedCPU(n1.CPU, n1.CPUCap)
 		out.Q1 = n1.Queue
 		out.RT1 = n1.RespMS
 		out.Node1CPUCap = n1.CPUCap
-		out.Node1BackendQ = n1.Queue
+		out.Node1BackendQ = o1.Inflight
 	}
-	if len(out.NodeSnapshots) > 1 {
-		n2 := out.NodeSnapshots[1]
+	if len(decisionNodes) > 1 {
+		n2 := decisionNodes[1]
+		o2 := n2
+		if len(observedNodes) > 1 {
+			o2 = observedNodes[1]
+		}
 		out.Node2Name = n2.Name
-		out.CPU2 = n2.CPU
+		out.CPU2 = o2.CPU
 		out.CPU2Normalized = lbtypes.CalculateNormalizedCPU(n2.CPU, n2.CPUCap)
 		out.Q2 = n2.Queue
 		out.RT2 = n2.RespMS
 		out.Node2CPUCap = n2.CPUCap
-		out.Node2BackendQ = n2.Queue
+		out.Node2BackendQ = o2.Inflight
 	}
 	return out
 }
@@ -432,4 +570,39 @@ func ApplyMetricPenalty(node *lbtypes.BackendNode) {
 		99999.0,
 		snapshot.CPUCap,
 	)
+}
+
+func decayToBaseline(value, baseline float64, age, staleAfter, decayWindow time.Duration) float64 {
+	if value <= 0 {
+		value = baseline
+	}
+	if age <= staleAfter || staleAfter <= 0 {
+		return value
+	}
+	elapsed := age - staleAfter
+	if decayWindow <= 0 || elapsed >= decayWindow {
+		return baseline
+	}
+	ratio := 1.0 - (float64(elapsed) / float64(decayWindow))
+	if ratio < 0 {
+		ratio = 0
+	}
+	return baseline + ((value - baseline) * ratio)
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a >= b {
+		return a
+	}
+	return b
+}
+
+func clampCPU(v float64) float64 {
+	if v <= 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
 }

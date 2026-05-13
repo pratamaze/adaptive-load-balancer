@@ -54,6 +54,19 @@ type perSecondAggregate struct {
 	node1Req int64
 	node2Req int64
 
+	node1CPURawSum          float64
+	node2CPURawSum          float64
+	node1CPUNormalizedSum   float64
+	node2CPUNormalizedSum   float64
+	node1InflightSum        float64
+	node2InflightSum        float64
+	node1BackendInflightSum float64
+	node2BackendInflightSum float64
+	node1RTSum              float64
+	node2RTSum              float64
+	node1SampleN            int64
+	node2SampleN            int64
+
 	score1Sum float64
 	score2Sum float64
 	scoreN    int64
@@ -126,8 +139,20 @@ func accumulateSnapshot(agg *perSecondAggregate, snapshot *lbtypes.DecisionSnaps
 	switch selected {
 	case agg.node1Name:
 		agg.node1Req++
+		agg.node1CPURawSum += snapshot.CPU1
+		agg.node1CPUNormalizedSum += snapshot.CPU1Normalized
+		agg.node1InflightSum += snapshot.Q1
+		agg.node1BackendInflightSum += snapshot.Node1BackendQ
+		agg.node1RTSum += snapshot.RT1
+		agg.node1SampleN++
 	case agg.node2Name:
 		agg.node2Req++
+		agg.node2CPURawSum += snapshot.CPU2
+		agg.node2CPUNormalizedSum += snapshot.CPU2Normalized
+		agg.node2InflightSum += snapshot.Q2
+		agg.node2BackendInflightSum += snapshot.Node2BackendQ
+		agg.node2RTSum += snapshot.RT2
+		agg.node2SampleN++
 	}
 
 	agg.score1Sum += snapshot.Score1
@@ -165,6 +190,17 @@ func flushAggregate(file *os.File, writer *bufio.Writer, agg *perSecondAggregate
 	}
 
 	totalReq := agg.node1Req + agg.node2Req
+	avgNode1CPU := averageByCount(agg.node1CPURawSum, agg.node1SampleN)
+	avgNode2CPU := averageByCount(agg.node2CPURawSum, agg.node2SampleN)
+	avgNode1CPUNorm := averageByCount(agg.node1CPUNormalizedSum, agg.node1SampleN)
+	avgNode2CPUNorm := averageByCount(agg.node2CPUNormalizedSum, agg.node2SampleN)
+	avgNode1Inflight := averageByCount(agg.node1InflightSum, agg.node1SampleN)
+	avgNode2Inflight := averageByCount(agg.node2InflightSum, agg.node2SampleN)
+	avgNode1BackendInflight := averageByCount(agg.node1BackendInflightSum, agg.node1SampleN)
+	avgNode2BackendInflight := averageByCount(agg.node2BackendInflightSum, agg.node2SampleN)
+	avgNode1RT := averageByCount(agg.node1RTSum, agg.node1SampleN)
+	avgNode2RT := averageByCount(agg.node2RTSum, agg.node2SampleN)
+
 	record := []string{
 		time.Now().UTC().Format(time.RFC3339Nano),
 		"1000",
@@ -176,20 +212,20 @@ func flushAggregate(file *os.File, writer *bufio.Writer, agg *perSecondAggregate
 		strconv.FormatInt(agg.node2Req, 10),
 		strconv.FormatInt(totalReq, 10),
 		// Kolom raw dipertahankan untuk kompatibilitas dataset historis.
-		formatFloatCSV(s.CPU1),
-		formatFloatCSV(s.CPU2),
-		formatFloatCSV(s.CPU1Normalized),
-		formatFloatCSV(s.CPU2Normalized),
+		formatFloatCSV(avgNode1CPU),
+		formatFloatCSV(avgNode2CPU),
+		formatFloatCSV(avgNode1CPUNorm),
+		formatFloatCSV(avgNode2CPUNorm),
 		formatFloatCSV(cpuCap1),
 		formatFloatCSV(cpuCap2),
-		formatFloatCSV(s.Q1),
-		formatFloatCSV(s.Q2),
-		formatFloatCSV(s.Node1BackendQ),
-		formatFloatCSV(s.Node2BackendQ),
-		formatFloatCSV(s.Q1),
-		formatFloatCSV(s.Q2),
-		formatFloatCSV(s.RT1),
-		formatFloatCSV(s.RT2),
+		formatFloatCSV(avgNode1Inflight),
+		formatFloatCSV(avgNode2Inflight),
+		formatFloatCSV(avgNode1BackendInflight),
+		formatFloatCSV(avgNode2BackendInflight),
+		formatFloatCSV(avgNode1Inflight),
+		formatFloatCSV(avgNode2Inflight),
+		formatFloatCSV(avgNode1RT),
+		formatFloatCSV(avgNode2RT),
 		formatFloatCSV(avgScore1),
 		formatFloatCSV(avgScore2),
 		formatFloatCSV(osIdleCPU10),
@@ -210,6 +246,18 @@ func flushAggregate(file *os.File, writer *bufio.Writer, agg *perSecondAggregate
 
 	agg.node1Req = 0
 	agg.node2Req = 0
+	agg.node1CPURawSum = 0
+	agg.node2CPURawSum = 0
+	agg.node1CPUNormalizedSum = 0
+	agg.node2CPUNormalizedSum = 0
+	agg.node1InflightSum = 0
+	agg.node2InflightSum = 0
+	agg.node1BackendInflightSum = 0
+	agg.node2BackendInflightSum = 0
+	agg.node1RTSum = 0
+	agg.node2RTSum = 0
+	agg.node1SampleN = 0
+	agg.node2SampleN = 0
 	agg.score1Sum = 0
 	agg.score2Sum = 0
 	agg.scoreN = 0
@@ -248,4 +296,11 @@ func initCSV(csvPath string) (*os.File, *bufio.Writer, error) {
 
 func formatFloatCSV(value float64) string {
 	return strconv.FormatFloat(value, 'f', 6, 64)
+}
+
+func averageByCount(sum float64, n int64) float64 {
+	if n <= 0 {
+		return 0
+	}
+	return sum / float64(n)
 }

@@ -1,7 +1,10 @@
 package fuzzy
 
 import (
+	"math/rand"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	lbtypes "load-balancer/pkg/types"
 )
@@ -10,6 +13,7 @@ type baseFuzzyStrategy struct {
 	engine      *Engine
 	rules       []Rule
 	decisionTag string
+	seedCounter atomic.Int64
 }
 
 func (s *baseFuzzyStrategy) SelectNode(nodes []lbtypes.BackendNode, snapshot *lbtypes.DecisionSnapshot) *lbtypes.BackendNode {
@@ -23,9 +27,9 @@ func (s *baseFuzzyStrategy) SelectNode(nodes []lbtypes.BackendNode, snapshot *lb
 		snapshot.DecisionTag = s.decisionTag
 	}
 
-	bestIdx := 0
-	bestScore := -1.0
+	selectedIdx := 0
 	totalScore := 0.0
+	scores := make([]float64, len(nodes))
 
 	for i := range nodes {
 		normalizedCPU := lbtypes.CalculateNormalizedCPU(nodes[i].CPU, nodes[i].CPUCap)
@@ -37,6 +41,7 @@ func (s *baseFuzzyStrategy) SelectNode(nodes []lbtypes.BackendNode, snapshot *lb
 		if score < 0 {
 			score = 0
 		}
+		scores[i] = score
 		totalScore += score
 		if i == 0 {
 			snapshot.CPU1Normalized = normalizedCPU
@@ -46,18 +51,35 @@ func (s *baseFuzzyStrategy) SelectNode(nodes []lbtypes.BackendNode, snapshot *lb
 			snapshot.CPU2Normalized = normalizedCPU
 			snapshot.Score2 = score
 		}
-		if score > bestScore {
-			bestScore = score
-			bestIdx = i
-		}
 	}
 
 	snapshot.TotalScore = totalScore
-	snapshot.RouletteValue = -1
-	if bestIdx < 0 || bestIdx >= len(nodes) {
+	rng := rand.New(rand.NewSource(time.Now().UnixNano() + s.seedCounter.Add(1)))
+	if totalScore > 0 {
+		roll := rng.Float64() * totalScore
+		snapshot.RouletteValue = roll
+		cumulative := 0.0
+		selectedIdx = len(nodes) - 1
+		for i, score := range scores {
+			cumulative += score
+			if roll <= cumulative {
+				selectedIdx = i
+				break
+			}
+		}
+	} else {
+		roll := rng.Float64()
+		snapshot.RouletteValue = roll
+		selectedIdx = int(roll * float64(len(nodes)))
+		if selectedIdx >= len(nodes) {
+			selectedIdx = len(nodes) - 1
+		}
+	}
+
+	if selectedIdx < 0 || selectedIdx >= len(nodes) {
 		return &nodes[0]
 	}
-	return &nodes[bestIdx]
+	return &nodes[selectedIdx]
 }
 
 type FuzzyBaseStrategy struct {

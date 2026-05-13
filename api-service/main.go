@@ -48,7 +48,7 @@ type CPUTelemetryResponse struct {
 
 func startCPUTelemetrySampler() {
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 
 		for range ticker.C {
@@ -193,11 +193,17 @@ func stressTestHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	deadline := start.Add(time.Duration(targetMS) * time.Millisecond)
+	ctx := r.Context()
 
 	candidate := 2
 	primesComputed := 0
 	lastPrime := 2
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		if isPrime(candidate) {
 			lastPrime = candidate
 			primesComputed++

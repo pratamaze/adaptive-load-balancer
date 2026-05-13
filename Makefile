@@ -48,6 +48,9 @@ LOCUST_FILE ?= $(CURDIR)/tests/locust/locustfile.py
 LOCUST_HOST ?= http://172.188.240.101
 LOCUST_ENDPOINT_PATH ?= /api/stress-test?ms=50
 LOCUST_OUT_DIR ?= $(CURDIR)/tests/locust/results
+MANUAL_REQ_COUNT ?= 1
+MANUAL_REQ_DELAY_MS ?= 0
+MANUAL_REQ_TIMEOUT_SEC ?= 10
 
 DATASET_HEADER := timestamp_utc,window_ms,traffic_log_mode,cpu_usage_unit,node1_name,node2_name,node1_requests,node2_requests,total_requests,node1_cpu_raw_usage,node2_cpu_raw_usage,node1_cpu_normalized_usage,node2_cpu_normalized_usage,node1_cpu_capacity,node2_cpu_capacity,node1_inflight,node2_inflight,node1_backend_inflight,node2_backend_inflight,node1_queue,node2_queue,node1_response_ms,node2_response_ms,node1_fuzzy_score,node2_fuzzy_score,os_idle_cpu
 
@@ -55,7 +58,7 @@ SSH_OPTS := -i $(SSH_KEY) -p $(SSH_PORT)
 SCP_OPTS := -i $(SSH_KEY) -P $(SSH_PORT)
 REMOTE_ADDR := $(REMOTE_USER)@$(REMOTE_HOST)
 
-.PHONY: help image-build image-push image-build-push image-deploy image-update image-update-fmopso image-update-fuzzy dataset-pull dataset-capture-live capture-dataset train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source show-lb-runtime verify-capture-ready verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source locust-normal locust-spike locust-ramp
+.PHONY: help image-build image-push image-build-push image-deploy image-update image-update-fmopso image-update-fuzzy dataset-pull dataset-capture-live capture-dataset train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source show-lb-runtime verify-capture-ready verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source locust-normal locust-spike locust-ramp manual-requests
 
 help:
 	@echo "Available targets:"
@@ -77,6 +80,7 @@ help:
 	@echo "  make locust-normal     # Jalankan load test Locust skenario normal (4 menit)"
 	@echo "  make locust-spike      # Jalankan load test Locust skenario spike (5 menit)"
 	@echo "  make locust-ramp       # Jalankan load test Locust skenario ramp/stress (5 menit)"
+	@echo "  make manual-requests MANUAL_REQ_COUNT=1   # Kirim N request manual exact-count untuk audit startup"
 
 image-build:
 	docker build -t $(LB_IMAGE_REPO):$(IMAGE_TAG) $(LB_MODULE_DIR)
@@ -340,3 +344,43 @@ locust-spike:
 locust-ramp:
 	@mkdir -p $(LOCUST_OUT_DIR)
 	locust -f $(LOCUST_FILE) --host $(LOCUST_HOST) --headless --scenario ramp --endpoint-path "$(LOCUST_ENDPOINT_PATH)" --csv $(LOCUST_OUT_DIR)/ramp
+
+manual-requests:
+	@count="$(MANUAL_REQ_COUNT)"; \
+	delay_ms="$(MANUAL_REQ_DELAY_MS)"; \
+	timeout_sec="$(MANUAL_REQ_TIMEOUT_SEC)"; \
+	if ! echo "$$count" | grep -Eq '^[0-9]+$$' || [ "$$count" -le 0 ]; then \
+		echo "MANUAL_REQ_COUNT harus bilangan bulat > 0"; \
+		exit 1; \
+	fi; \
+	if ! echo "$$delay_ms" | grep -Eq '^[0-9]+$$'; then \
+		echo "MANUAL_REQ_DELAY_MS harus bilangan bulat >= 0"; \
+		exit 1; \
+	fi; \
+	if ! echo "$$timeout_sec" | grep -Eq '^[0-9]+$$' || [ "$$timeout_sec" -le 0 ]; then \
+		echo "MANUAL_REQ_TIMEOUT_SEC harus bilangan bulat > 0"; \
+		exit 1; \
+	fi; \
+	base_url="$(LOCUST_HOST)$(LOCUST_ENDPOINT_PATH)"; \
+	echo "Sending $$count manual request(s) to $$base_url"; \
+	i=1; \
+	while [ "$$i" -le "$$count" ]; do \
+		nonce="$$(date +%s%N)"; \
+		case "$$base_url" in \
+			*'?'*) url="$$base_url&nocache=$$nonce" ;; \
+			*) url="$$base_url?nocache=$$nonce" ;; \
+		esac; \
+		started_utc="$$(date -u +"%Y-%m-%dT%H:%M:%S.%NZ")"; \
+		status="$$(curl -sS -o /dev/null --connect-timeout 3 --max-time "$$timeout_sec" \
+			-H "Connection: close" \
+			-H "Cache-Control: no-cache" \
+			-H "Pragma: no-cache" \
+			-w "%{http_code}" "$$url" || echo "000")"; \
+		ended_utc="$$(date -u +"%Y-%m-%dT%H:%M:%S.%NZ")"; \
+		echo "[MANUAL_REQ] idx=$$i status=$$status started_utc=$$started_utc ended_utc=$$ended_utc url=$$url"; \
+		if [ "$$delay_ms" -gt 0 ] && [ "$$i" -lt "$$count" ]; then \
+			delay_s="$$(printf "%d.%03d" "$$((delay_ms / 1000))" "$$((delay_ms % 1000))")"; \
+			sleep "$$delay_s"; \
+		fi; \
+		i="$$((i + 1))"; \
+	done
