@@ -83,13 +83,13 @@ type RuntimeConfig struct {
 func Load() (RuntimeConfig, error) {
 	ensureDirs("configs", "storage")
 
-	algorithm := normalizeAlgorithm(envLower("LB_ALGORITHM", "fuzzy_base"))
+	algorithm := normalizeAlgorithm(envLowerAliases([]string{"LB_ALGORITHM", "LB_ALGO"}, "fuzzy_base"))
 	trafficLogMode := normalizeTrafficLogMode(envLower("TRAFFIC_LOG_MODE", TrafficLogModePerHit))
 	backendNodes, err := initBackendNodes([]string{"http://api-node1:8080", "http://api-node2:8080"})
 	if err != nil {
 		return RuntimeConfig{}, err
 	}
-	fuzzyBootstrap := initializeFuzzyEngines(algorithm)
+	fuzzyBootstrap := initializeFuzzyEngines(algorithm, normalizeFuzzyParamSource(envLower("FUZZY_PARAM_SOURCE", "base")))
 
 	return RuntimeConfig{
 		Algorithm:              algorithm,
@@ -117,6 +117,16 @@ func envLower(key, fallback string) string {
 		return fallback
 	}
 	return strings.ToLower(v)
+}
+
+func envLowerAliases(keys []string, fallback string) string {
+	for _, key := range keys {
+		v := strings.TrimSpace(os.Getenv(key))
+		if v != "" {
+			return strings.ToLower(v)
+		}
+	}
+	return fallback
 }
 
 func envDurationMS(key string, fallback time.Duration) time.Duration {
@@ -155,6 +165,18 @@ func normalizeTrafficLogMode(value string) string {
 	default:
 		log.Printf("[WARNING] TRAFFIC_LOG_MODE tidak dikenal (%s), fallback ke %s", value, TrafficLogModeWindow)
 		return TrafficLogModeWindow
+	}
+}
+
+func normalizeFuzzyParamSource(value string) string {
+	switch value {
+	case "", "base":
+		return "base"
+	case "optimized", "mopso":
+		return "optimized"
+	default:
+		log.Printf("[WARNING] FUZZY_PARAM_SOURCE tidak dikenal (%s), fallback ke base", value)
+		return "base"
 	}
 }
 
@@ -215,7 +237,7 @@ func readCPUCapacityEnv(key string) (float64, bool) {
 	return value, true
 }
 
-func initializeFuzzyEngines(algorithm string) FuzzyBootstrap {
+func initializeFuzzyEngines(algorithm, paramSource string) FuzzyBootstrap {
 	ensureBaseParamsFile(baseFuzzyParamsPath, DefaultBaseFuzzyParams)
 	baseParams := loadFloatArrayWithFallback(baseFuzzyParamsPath, DefaultBaseFuzzyParams, "base fuzzy params")
 	baseParams = sanitizeFuzzyParams(baseParams)
@@ -227,12 +249,13 @@ func initializeFuzzyEngines(algorithm string) FuzzyBootstrap {
 		MOPSOEngine:  fuzzy.NewEngine(mopsoParams),
 		ParamProfile: "BASE",
 	}
-	if algorithm == "fuzzy_mopso" {
+	if algorithm == "fuzzy_mopso" || paramSource == "optimized" {
 		bootstrap.ParamProfile = "OPTIMIZED_MOPSO"
 	}
 	log.Printf(
-		"[ENTRYPOINT][PARAM-SOURCE] ALGO=%s PROFILE=%s BASE_FILE=%s MOPSO_FILE=%s",
+		"[ENTRYPOINT][PARAM-SOURCE] ALGO=%s REQUESTED_SOURCE=%s PROFILE=%s BASE_FILE=%s MOPSO_FILE=%s",
 		algorithm,
+		paramSource,
 		bootstrap.ParamProfile,
 		baseFuzzyParamsPath,
 		optimizedFuzzyPath,

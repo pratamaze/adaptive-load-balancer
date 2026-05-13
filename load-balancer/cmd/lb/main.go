@@ -28,7 +28,11 @@ func main() {
 	case "fuzzy_mopso":
 		activeStrategy = fuzzy.NewFuzzyMOPSOStrategy(cfg.Fuzzy.MOPSOEngine, config.DefaultRules)
 	default:
-		activeStrategy = fuzzy.NewFuzzyBaseStrategy(cfg.Fuzzy.BaseEngine, config.DefaultRules)
+		if cfg.Fuzzy.ParamProfile == "OPTIMIZED_MOPSO" {
+			activeStrategy = fuzzy.NewFuzzyMOPSOStrategy(cfg.Fuzzy.MOPSOEngine, config.DefaultRules)
+		} else {
+			activeStrategy = fuzzy.NewFuzzyBaseStrategy(cfg.Fuzzy.BaseEngine, config.DefaultRules)
+		}
 	}
 
 	decisionSnapshotC := dataset.NewSnapshotChannel(cfg.DecisionSnapshotBuffer)
