@@ -20,12 +20,22 @@ func NewEngine(initialParams []float64) *Engine {
 
 // UpdateParams dipanggil oleh optimizer (PSO/MOPSO) untuk memperbarui parameter.
 func (e *Engine) UpdateParams(newParams []float64) {
+	const alpha = 0.15
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
 	if len(e.params) != len(newParams) {
 		e.params = make([]float64, len(newParams))
+		copy(e.params, newParams)
+		return
 	}
-	copy(e.params, newParams)
+
+	// EMA smoothing mencegah osilasi agresif saat parameter hot-reload.
+	// p_t = alpha * p_baru + (1-alpha) * p_lama
+	for i := range newParams {
+		e.params[i] = (alpha * newParams[i]) + ((1 - alpha) * e.params[i])
+	}
 }
 
 // GetParams mengembalikan snapshot parameter saat ini.
@@ -56,19 +66,19 @@ func (e *Engine) CalculateMamdani(node NodeMetrics, rules []Rule) float64 {
 	params := e.snapshotParams()
 
 	muCPU := [3]float64{
-		Fuzzify(node.CPU, Triple{params[0], params[1], params[2]}),
-		Fuzzify(node.CPU, Triple{params[3], params[4], params[5]}),
-		Fuzzify(node.CPU, Triple{params[6], params[7], params[8]}),
+		FuzzifyLeft(node.CPU, Triple{params[0], params[1], params[2]}),
+		FuzzifyTriangle(node.CPU, Triple{params[3], params[4], params[5]}),
+		FuzzifyRight(node.CPU, Triple{params[6], params[7], params[8]}),
 	}
 	muQueue := [3]float64{
-		Fuzzify(node.QueueLength, Triple{params[9], params[10], params[11]}),
-		Fuzzify(node.QueueLength, Triple{params[12], params[13], params[14]}),
-		Fuzzify(node.QueueLength, Triple{params[15], params[16], params[17]}),
+		FuzzifyLeft(node.QueueLength, Triple{params[9], params[10], params[11]}),
+		FuzzifyTriangle(node.QueueLength, Triple{params[12], params[13], params[14]}),
+		FuzzifyRight(node.QueueLength, Triple{params[15], params[16], params[17]}),
 	}
 	muResp := [3]float64{
-		Fuzzify(node.RespTime, Triple{params[18], params[19], params[20]}),
-		Fuzzify(node.RespTime, Triple{params[21], params[22], params[23]}),
-		Fuzzify(node.RespTime, Triple{params[24], params[25], params[26]}),
+		FuzzifyLeft(node.RespTime, Triple{params[18], params[19], params[20]}),
+		FuzzifyTriangle(node.RespTime, Triple{params[21], params[22], params[23]}),
+		FuzzifyRight(node.RespTime, Triple{params[24], params[25], params[26]}),
 	}
 
 	alphaOut := [3]float64{}
@@ -129,15 +139,4 @@ func respLabelToIndex(label string) int {
 	default:
 		return -1
 	}
-}
-
-// CalculateMamdani mempertahankan kompatibilitas API lama (Pure Fuzzy default).
-func CalculateMamdani(node NodeMetrics, rules []Rule) float64 {
-	defaultParams := []float64{
-		0, 0, 50, 0, 50, 100, 50, 100, 100,
-		0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
-		0, 0, 500, 0, 500, 1000, 500, 1000, 1000,
-	}
-	engine := NewEngine(defaultParams)
-	return engine.CalculateMamdani(node, rules)
 }

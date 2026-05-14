@@ -4,7 +4,7 @@
     COPY go.mod ./
     RUN go mod download
     COPY . .
-    RUN CGO_ENABLED=0 GOOS=linux go build -o /loadbalancer ./main.go
+    RUN CGO_ENABLED=0 GOOS=linux go build -o /loadbalancer ./cmd/lb
     
     # Stage 2: Final Image
     FROM alpine:latest

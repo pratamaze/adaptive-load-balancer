@@ -10,12 +10,12 @@ import (
 const (
 	Dimensions   = 27
 	NumParticles = 20
-	Iterations   = 1800
+	Iterations   = 1900
 	maxArchive   = 128
-	inertiaMaxW  = 0.92
-	inertiaMinW  = 0.36
-	cognitiveC1  = 1.15
-	socialC2     = 2.05
+	inertiaMaxW  = 0.50
+	inertiaMinW  = 0.40
+	cognitiveC1  = 1.0
+	socialC2     = 2.0
 )
 
 // NodeState menyimpan data historis + metrik observasi saat replay.
@@ -75,20 +75,11 @@ type evaluator struct {
 	snap       HistoricalSnapshot
 	totalReq   int64
 	costPerReq [2]float64
+	cpuForFuzz [2]float64
 	capacity   [2]float64
 }
 
 func newEvaluator(snap HistoricalSnapshot) evaluator {
-	r1 := maxInt64(snap.Node1.Requests, 1)
-	r2 := maxInt64(snap.Node2.Requests, 1)
-	c1 := (snap.Node1.CPUUsage - snap.OSIdleCPU10) / float64(r1)
-	c2 := (snap.Node2.CPUUsage - snap.OSIdleCPU10) / float64(r2)
-	if c1 < 0 {
-		c1 = 0
-	}
-	if c2 < 0 {
-		c2 = 0
-	}
 	cap1 := snap.Node1.CPUCapacity
 	if cap1 <= 0 {
 		cap1 = 100
@@ -97,17 +88,31 @@ func newEvaluator(snap HistoricalSnapshot) evaluator {
 	if cap2 <= 0 {
 		cap2 = 100
 	}
+	cpuRaw1 := toRawCPU(snap.Node1.CPUUsage, cap1)
+	cpuRaw2 := toRawCPU(snap.Node2.CPUUsage, cap2)
+
+	r1 := maxInt64(snap.Node1.Requests, 1)
+	r2 := maxInt64(snap.Node2.Requests, 1)
+	c1 := (cpuRaw1 - snap.OSIdleCPU10) / float64(r1)
+	c2 := (cpuRaw2 - snap.OSIdleCPU10) / float64(r2)
+	if c1 < 0 {
+		c1 = 0
+	}
+	if c2 < 0 {
+		c2 = 0
+	}
 	return evaluator{
 		snap:       snap,
 		totalReq:   snap.Node1.Requests + snap.Node2.Requests,
 		costPerReq: [2]float64{c1, c2},
+		cpuForFuzz: [2]float64{toNormalizedCPU(snap.Node1.CPUUsage, cap1), toNormalizedCPU(snap.Node2.CPUUsage, cap2)},
 		capacity:   [2]float64{cap1, cap2},
 	}
 }
 
 func (e evaluator) evaluate(params []float64) (Objective, float64, float64) {
-	score1 := fuzzyScore(params, e.snap.Node1.CPUUsage, e.snap.Node1.QueueLength, e.snap.Node1.ResponseTime)
-	score2 := fuzzyScore(params, e.snap.Node2.CPUUsage, e.snap.Node2.QueueLength, e.snap.Node2.ResponseTime)
+	score1 := fuzzyScore(params, e.cpuForFuzz[0], e.snap.Node1.QueueLength, e.snap.Node1.ResponseTime)
+	score2 := fuzzyScore(params, e.cpuForFuzz[1], e.snap.Node2.QueueLength, e.snap.Node2.ResponseTime)
 	totalScore := score1 + score2
 	share1 := 0.5
 	if totalScore > 0 {
@@ -132,25 +137,42 @@ func (e evaluator) evaluate(params []float64) (Objective, float64, float64) {
 		sim2 = 0
 	}
 
-	// Objective disejajarkan ke kapasitas node heterogen.
-	util1 := sim1 / maxFloat(e.capacity[0], 1e-9)
-	util2 := sim2 / maxFloat(e.capacity[1], 1e-9)
-	sumCPU := util1 + util2
-	if sumCPU < 1e-9 {
-		sumCPU = 1e-9
+	// RU mengikuti kapasitas heterogen per node: RU = SimulatedCPU / CPUCapacity.
+	ru1 := sim1 / maxFloat(e.capacity[0], 1e-9)
+	ru2 := sim2 / maxFloat(e.capacity[1], 1e-9)
+	if ru1 < 0 {
+		ru1 = 0
 	}
-	di := math.Abs(util1-util2) / sumCPU
-	hi := math.Max(util1, util2)
-	lo := math.Min(util1, util2)
-	bcu := lo / maxFloat(hi, 1e-9)
-	diPenalty := (2.8 * di * di) + (1.4 * (1.0 - bcu) * (1.0 - bcu))
+	if ru2 < 0 {
+		ru2 = 0
+	}
+
+	// DI harus diminimalkan menuju 0 (selisih absolut antar utilitas).
+	di := math.Abs(ru1 - ru2)
+
+	// BCU secara alami dimaksimalkan (mendekati 1), lalu dibalik jadi penalti untuk minimization.
+	hi := math.Max(ru1, ru2)
+	lo := math.Min(ru1, ru2)
+	bcu := 1.0
+	if hi > 1e-9 {
+		bcu = lo / hi
+	}
+	if bcu < 0 {
+		bcu = 0
+	}
+	if bcu > 1 {
+		bcu = 1
+	}
+	penaltyBCU := 1.0 - bcu
+
+	imbalancePenalty := (2.8 * di * di) + (1.4 * penaltyBCU * penaltyBCU)
 	latTail := math.Max(e.snap.Node1.ResponseTime, e.snap.Node2.ResponseTime) / 1000.0
 	peakPenalty := hi + 0.30*latTail
 
 	// f1 = penalti keseimbangan berbasis DI+BCU.
 	// f2 = penalti puncak utilitas node + latensi tail.
 	obj := Objective{
-		Imbalance: diPenalty,
+		Imbalance: imbalancePenalty,
 		PeakLoad:  peakPenalty,
 	}
 	return obj, sim1, sim2
@@ -168,6 +190,19 @@ func OptimizeReplay(baseParams []float64, snap HistoricalSnapshot) ParetoResult 
 		return result
 	}
 
+	// Elitism Injection:
+	// siapkan 1 seed baseline yang selalu hadir di swarm agar tidak kehilangan
+	// "ingatan" parameter fuzzy statis ketika eksplorasi partikel lain memburuk.
+	seedParams := make([]float64, Dimensions)
+	for d := 0; d < Dimensions; d++ {
+		base := lowerBound(d)
+		if d < len(baseParams) {
+			base = baseParams[d]
+		}
+		seedParams[d] = clamp(base, lowerBound(d), upperBound(d))
+	}
+	repairParams(seedParams)
+
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	particles := make([]particle, NumParticles)
 	archive := make([]Solution, 0, 32)
@@ -176,8 +211,30 @@ func OptimizeReplay(baseParams []float64, snap HistoricalSnapshot) ParetoResult 
 		x := make([]float64, Dimensions)
 		v := make([]float64, Dimensions)
 		pb := make([]float64, Dimensions)
+
+		if i == 0 {
+			// Partikel elit: posisi awal = baseline, pBest awal = baseline.
+			copy(x, seedParams)
+			copy(pb, seedParams)
+			obj, sim1, sim2 := eval.evaluate(x)
+			particles[i] = particle{
+				x:       x,
+				v:       v, // nol agar seed baseline stabil saat iterasi awal
+				pbest:   pb,
+				pbestO:  obj,
+				hasBest: true,
+			}
+			archive = addToArchive(archive, Solution{
+				Params:        clone27(x),
+				Objective:     obj,
+				SimulatedCPU1: sim1,
+				SimulatedCPU2: sim2,
+			})
+			continue
+		}
+
 		for d := 0; d < Dimensions; d++ {
-			base := baseParams[d]
+			base := seedParams[d]
 			rangeDelta := 8.0
 			x[d] = clamp(base+(rng.Float64()*2*rangeDelta-rangeDelta), lowerBound(d), upperBound(d))
 			v[d] = rng.Float64()*2 - 1
@@ -219,6 +276,7 @@ func OptimizeReplay(baseParams []float64, snap HistoricalSnapshot) ParetoResult 
 				r1 := rng.Float64()
 				r2 := rng.Float64()
 				v := w*p.v[d] + cognitiveC1*r1*(p.pbest[d]-p.x[d]) + socialC2*r2*(leader.Params[d]-p.x[d])
+				v = clampVelocity(v, d)
 				x := p.x[d] + v
 				p.v[d] = v
 				p.x[d] = clamp(x, lowerBound(d), upperBound(d))
@@ -377,9 +435,9 @@ func upperBound(d int) float64 {
 	case d <= 8:
 		return 100
 	case d <= 17:
-		return 2000
+		return 1000
 	default:
-		return 2000
+		return 1000
 	}
 }
 
@@ -391,6 +449,21 @@ func clamp(v, lo, hi float64) float64 {
 		return hi
 	}
 	return v
+}
+
+func clampVelocity(v float64, d int) float64 {
+	vmax := maxVelocity(d)
+	return clamp(v, -vmax, vmax)
+}
+
+func maxVelocity(d int) float64 {
+	// Batas kecepatan 10% rentang domain tiap dimensi
+	// agar pergerakan partikel tetap stabil dan tidak eksplosif.
+	span := upperBound(d) - lowerBound(d)
+	if span <= 0 {
+		return 1
+	}
+	return 0.10 * span
 }
 
 func maxInt64(a, b int64) int64 {
@@ -407,6 +480,38 @@ func maxFloat(a, b float64) float64 {
 	return b
 }
 
+// toRawCPU mengasumsikan input CPU sudah berupa raw (0..cap) lalu melakukan clamp aman.
+func toRawCPU(cpu, cap float64) float64 {
+	capacity := cap
+	if capacity <= 0 {
+		capacity = 100
+	}
+	if cpu < 0 {
+		return 0
+	}
+	if cpu > capacity {
+		return capacity
+	}
+	return cpu
+}
+
+// toNormalizedCPU mengubah raw CPU ke skala normalized 0..100 berdasarkan kapasitas node.
+func toNormalizedCPU(cpu, cap float64) float64 {
+	capacity := cap
+	if capacity <= 0 {
+		capacity = 100
+	}
+	if cpu < 0 {
+		return 0
+	}
+	raw := toRawCPU(cpu, capacity)
+	norm := (raw / capacity) * 100.0
+	if norm > 100 {
+		return 100
+	}
+	return norm
+}
+
 func clone27(src []float64) []float64 {
 	dst := make([]float64, Dimensions)
 	copy(dst, src)
@@ -419,8 +524,11 @@ func almostEqual(a, b float64) bool {
 }
 
 func repairParams(params []float64) {
-	const eps = 1e-6
 	for i := 0; i+2 < len(params); i += 3 {
+		minGap := 20.0
+		if i <= 8 {
+			minGap = 2.0
+		}
 		a := clamp(params[i], lowerBound(i), upperBound(i))
 		b := clamp(params[i+1], lowerBound(i+1), upperBound(i+1))
 		c := clamp(params[i+2], lowerBound(i+2), upperBound(i+2))
@@ -435,32 +543,32 @@ func repairParams(params []float64) {
 			a, b = b, a
 		}
 
-		if b < a+eps {
-			b = a + eps
+		if b < a+minGap {
+			b = a + minGap
 		}
-		if c < b+eps {
-			c = b + eps
+		if c < b+minGap {
+			c = b + minGap
 		}
 
 		hi := upperBound(i)
 		if c > hi {
 			c = hi
-			if b > c-eps {
-				b = c - eps
+			if b > c-minGap {
+				b = c - minGap
 			}
-			if b < a+eps {
-				a = b - eps
+			if b < a+minGap {
+				a = b - minGap
 			}
 		}
 		lo := lowerBound(i)
 		if a < lo {
 			a = lo
 		}
-		if b < a+eps {
-			b = a + eps
+		if b < a+minGap {
+			b = a + minGap
 		}
-		if c < b+eps {
-			c = b + eps
+		if c < b+minGap {
+			c = b + minGap
 		}
 		if c > hi {
 			c = hi
@@ -470,22 +578,94 @@ func repairParams(params []float64) {
 		params[i+1] = b
 		params[i+2] = c
 	}
+
+	// Jaga urutan label linguistik Low < Medium < High untuk puncak (b) tiap variabel.
+	enforcePeakOrder(params, 0, 2.0, 100.0)   // CPU
+	enforcePeakOrder(params, 9, 20.0, 1000.0) // Queue
+	enforcePeakOrder(params, 18, 20.0, 1000.0)
+
+	// Overlap enforcement per variabel linguistik (3 segitiga: Low, Medium, High)
+	// untuk menghindari dead zone antar himpunan.
+	for i := 0; i+8 < len(params); i += 9 {
+		// Gap antara Low.c dan Medium.a
+		if params[i+2] < params[i+3] {
+			mid := (params[i+2] + params[i+3]) / 2
+			params[i+2] = mid
+			params[i+3] = mid
+		}
+		// Gap antara Medium.c dan High.a
+		if params[i+5] < params[i+6] {
+			mid := (params[i+5] + params[i+6]) / 2
+			params[i+5] = mid
+			params[i+6] = mid
+		}
+	}
+}
+
+func enforcePeakOrder(params []float64, start int, minGap, hi float64) {
+	peaks := []float64{params[start+1], params[start+4], params[start+7]}
+	sort.Float64s(peaks)
+	if peaks[1] < peaks[0]+minGap {
+		peaks[1] = peaks[0] + minGap
+	}
+	if peaks[2] < peaks[1]+minGap {
+		peaks[2] = peaks[1] + minGap
+	}
+	if peaks[2] > hi {
+		peaks[2] = hi
+		if peaks[1] > peaks[2]-minGap {
+			peaks[1] = peaks[2] - minGap
+		}
+		if peaks[0] > peaks[1]-minGap {
+			peaks[0] = peaks[1] - minGap
+		}
+	}
+	if peaks[0] < 0 {
+		peaks[0] = 0
+	}
+	params[start+1] = peaks[0]
+	params[start+4] = peaks[1]
+	params[start+7] = peaks[2]
+
+	// Pastikan triangle tetap mengandung puncak dengan lebar minimum.
+	for tri := 0; tri < 3; tri++ {
+		aIdx := start + tri*3
+		bIdx := aIdx + 1
+		cIdx := aIdx + 2
+		b := params[bIdx]
+		lo := lowerBound(aIdx)
+		hiTri := upperBound(aIdx)
+		if params[aIdx] > b-minGap {
+			params[aIdx] = b - minGap
+		}
+		if params[cIdx] < b+minGap {
+			params[cIdx] = b + minGap
+		}
+		params[aIdx] = clamp(params[aIdx], lo, hiTri)
+		params[cIdx] = clamp(params[cIdx], lo, hiTri)
+		if params[aIdx] > b {
+			params[aIdx] = clamp(b-minGap, lo, hiTri)
+		}
+		if params[cIdx] < b {
+			params[cIdx] = clamp(b+minGap, lo, hiTri)
+		}
+	}
 }
 
 // ---- Fast fuzzy scoring (allocation-free path) ----
 
 func fuzzyScore(params []float64, cpu, q, rt float64) float64 {
-	muCPU0 := fuzzify(cpu, params[0], params[1], params[2])
-	muCPU1 := fuzzify(cpu, params[3], params[4], params[5])
-	muCPU2 := fuzzify(cpu, params[6], params[7], params[8])
+	muCPU0 := fuzzifyLeft(cpu, params[0], params[1], params[2])
+	muCPU1 := fuzzifyTriangle(cpu, params[3], params[4], params[5])
+	muCPU2 := fuzzifyRight(cpu, params[6], params[7], params[8])
 
-	muQ0 := fuzzify(q, params[9], params[10], params[11])
-	muQ1 := fuzzify(q, params[12], params[13], params[14])
-	muQ2 := fuzzify(q, params[15], params[16], params[17])
+	muQ0 := fuzzifyLeft(q, params[9], params[10], params[11])
+	muQ1 := fuzzifyTriangle(q, params[12], params[13], params[14])
+	muQ2 := fuzzifyRight(q, params[15], params[16], params[17])
 
-	muR0 := fuzzify(rt, params[18], params[19], params[20])
-	muR1 := fuzzify(rt, params[21], params[22], params[23])
-	muR2 := fuzzify(rt, params[24], params[25], params[26])
+	muR0 := fuzzifyLeft(rt, params[18], params[19], params[20])
+	muR1 := fuzzifyTriangle(rt, params[21], params[22], params[23])
+	muR2 := fuzzifyRight(rt, params[24], params[25], params[26])
 
 	cpuVals := [3]float64{muCPU0, muCPU1, muCPU2}
 	qVals := [3]float64{muQ0, muQ1, muQ2}
@@ -517,7 +697,21 @@ func fuzzyScore(params []float64, cpu, q, rt float64) float64 {
 	return mTotal / aTotal
 }
 
-func fuzzify(v, a, b, c float64) float64 {
+func fuzzifyLeft(v, a, b, c float64) float64 {
+	if v <= b {
+		return 1
+	}
+	if v >= c {
+		return 0
+	}
+	den := c - b
+	if den <= 0 {
+		return 0
+	}
+	return (c - v) / den
+}
+
+func fuzzifyTriangle(v, a, b, c float64) float64 {
 	if v == b {
 		return 1
 	}
@@ -536,6 +730,20 @@ func fuzzify(v, a, b, c float64) float64 {
 		return 0
 	}
 	return (c - v) / den
+}
+
+func fuzzifyRight(v, a, b, c float64) float64 {
+	if v >= b {
+		return 1
+	}
+	if v <= a {
+		return 0
+	}
+	den := b - a
+	if den <= 0 {
+		return 0
+	}
+	return (v - a) / den
 }
 
 func min3(a, b, c float64) float64 {
