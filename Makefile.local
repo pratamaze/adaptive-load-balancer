@@ -1,0 +1,13 @@
+LB_MODULE_DIR=/home/asus/code/loadBalancer/project-fpso/load-balancer
+
+REMOTE_USER=ripe
+REMOTE_HOST=172.188.240.101
+SSH_KEY=/home/asus/.ssh/node-loadbalancer_key.pem
+SSH_PORT=22
+
+# Optional overrides if VPS paths differ from defaults
+# REMOTE_LOGS_DIR=/home/ripe/load-balancer/logs
+# REMOTE_CONFIGS_DIR=/home/ripe/load-balancer/configs
+# LB_LOGS_DIR=/home/ripe/load-balancer/logs
+# LB_CONFIGS_DIR=/home/ripe/load-balancer/configs
+# LB_STORAGE_DIR=/home/ripe/load-balancer/storage
