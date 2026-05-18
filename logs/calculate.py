@@ -6,13 +6,104 @@ import warnings
 # Matikan warning dari pandas biar output terminal bersih
 warnings.filterwarnings('ignore')
 
-def to_numeric_series(raw_series):
-    cleaned = (
-        raw_series.astype(str)
-        .str.replace(',', '.', regex=False)
-        .str.extract(r'([-+]?\d*\.?\d+)', expand=False)
-    )
-    return pd.to_numeric(cleaned, errors='coerce').dropna()
+def find_column(lower_to_original, aliases):
+    for alias in aliases:
+        key = alias.strip().lower()
+        if key in lower_to_original:
+            return lower_to_original[key]
+    return None
+
+def read_non_negative_column(df, aliases):
+    lower_to_original = {name.strip().lower(): name for name in df.columns}
+    column_name = find_column(lower_to_original, aliases)
+    if column_name is None:
+        return np.zeros(len(df), dtype=float), None
+
+    values = pd.to_numeric(df[column_name], errors='coerce').fillna(0).to_numpy(dtype=float)
+    values = np.where(values < 0, 0, values)
+    return values, column_name
+
+def build_effective_requests(df):
+    total_req_col, total_req_name = read_non_negative_column(df, ['total_requests'])
+    node1_req, node1_req_name = read_non_negative_column(df, ['node1_requests'])
+    node2_req, node2_req_name = read_non_negative_column(df, ['node2_requests'])
+
+    # Samakan dengan notebook Colab: request node dibulatkan ke count terdekat.
+    node1_req = np.rint(node1_req).astype(float)
+    node2_req = np.rint(node2_req).astype(float)
+
+    has_total_req = total_req_name is not None
+    has_node_req = node1_req_name is not None and node2_req_name is not None
+    summed_node_req = node1_req + node2_req
+
+    if has_total_req and has_node_req:
+        # Notebook memakai max(total_requests, node1_requests + node2_requests).
+        effective_requests = np.maximum(total_req_col, summed_node_req)
+    elif has_total_req:
+        effective_requests = total_req_col
+    elif has_node_req:
+        effective_requests = summed_node_req
+    else:
+        effective_requests = np.ones(len(df), dtype=float)
+
+    effective_requests = np.where(effective_requests < 0, 0, effective_requests)
+    active_traffic_mask = effective_requests > 0
+    return node1_req, node2_req, total_req_col, effective_requests, active_traffic_mask, has_total_req, has_node_req
+
+def resolve_cpu_columns(df):
+    lower_to_original = {name.strip().lower(): name for name in df.columns}
+    node1_col = find_column(lower_to_original, [
+        'node1_cpu_normalized_usage',
+        'node1_cpu_usage_normalized',
+        'node1_cpu_normalized',
+        'node_1_cpu_normalized_usage',
+    ])
+    node2_col = find_column(lower_to_original, [
+        'node2_cpu_normalized_usage',
+        'node2_cpu_usage_normalized',
+        'node2_cpu_normalized',
+        'node_2_cpu_normalized_usage',
+    ])
+    return node1_col, node2_col
+
+def clean_response_series_like_colab(values, fallback=1.0):
+    """
+    Samakan perilaku notebook Colab:
+    - nilai <= 0 dianggap missing
+    - isi dengan ffill/bfill
+    - fallback terakhir ke angka default
+    """
+    numeric = pd.to_numeric(pd.Series(values), errors='coerce').astype('float64')
+    numeric = numeric.replace([np.inf, -np.inf], np.nan)
+    numeric = numeric.mask(numeric <= 0)
+
+    finite = numeric.dropna()
+    fallback_value = float(finite.iloc[0]) if not finite.empty else float(fallback)
+    numeric = numeric.ffill().bfill().fillna(fallback_value)
+    return numeric.to_numpy(dtype=float)
+
+def compute_di_bcu_series(cpu1, cpu2):
+    total_cpu = cpu1 + cpu2
+    valid = (~np.isnan(cpu1)) & (~np.isnan(cpu2)) & (total_cpu > 0)
+
+    di_values = np.zeros(len(cpu1), dtype=float)
+    di_values[valid] = np.abs(cpu1[valid] - cpu2[valid]) / total_cpu[valid]
+    di_values = np.clip(di_values, 0.0, 1.0)
+
+    bcu_values = np.ones(len(cpu1), dtype=float)
+    bcu_values[valid] = 1.0 - di_values[valid]
+    bcu_values = np.clip(bcu_values, 0.0, 1.0)
+    return valid, di_values, bcu_values
+
+def compute_macro_di_bcu(avg_cpu1, avg_cpu2):
+    total_cpu = avg_cpu1 + avg_cpu2
+    if total_cpu <= 0:
+        return 0.0, 1.0
+
+    macro_di = abs(avg_cpu1 - avg_cpu2) / total_cpu
+    macro_di = float(np.clip(macro_di, 0.0, 1.0))
+    macro_bcu = float(np.clip(1.0 - macro_di, 0.0, 1.0))
+    return macro_di, macro_bcu
 
 def weighted_percentile(values, weights, percentile):
     """Hitung persentil berbobot tanpa mengulang array (kompatibel numpy lama)."""
@@ -44,34 +135,22 @@ def evaluate_csv(file_path):
         print("[ERROR] Dataset {} kosong!".format(file_path))
         return
 
-    node1_req = pd.to_numeric(df.get('node1_requests'), errors='coerce').fillna(0).values
-    node2_req = pd.to_numeric(df.get('node2_requests'), errors='coerce').fillna(0).values
-    node1_req = np.where(node1_req < 0, 0, node1_req)
-    node2_req = np.where(node2_req < 0, 0, node2_req)
+    node1_req, node2_req, total_req_col, effective_requests, active_traffic_mask, has_total_req, has_node_req = build_effective_requests(df)
+    total_requests = float(np.nansum(effective_requests))
 
-    # 1. Total Request
-    # Dataset per_hit di proyek ini menyimpan request agregat per row.
-    # Jadi total request harus dihitung dari sum total_requests / node requests, bukan jumlah baris.
-    total_req_col = pd.to_numeric(df.get('total_requests'), errors='coerce').fillna(0).values
-    total_req_col = np.where(total_req_col < 0, 0, total_req_col)
-
-    summed_total_req_col = float(np.nansum(total_req_col))
-    summed_node_req = float(np.nansum(node1_req + node2_req))
-
-    if summed_total_req_col > 0:
-        total_requests = summed_total_req_col
-    elif summed_node_req > 0:
-        total_requests = summed_node_req
-    else:
-        total_requests = float(len(df))
+    if not np.any(active_traffic_mask):
+        print("[ERROR] Dataset {} tidak memiliki snapshot traffic aktif (total_requests > 0 atau node1_requests + node2_requests > 0).".format(file_path))
+        return
 
     # 2. Hitung Makespan dari Timestamp UTC
     try:
-        ts = pd.to_datetime(df['timestamp_utc'])
+        ts = pd.to_datetime(df.loc[active_traffic_mask, 'timestamp_utc'], errors='coerce').dropna()
+        if ts.empty:
+            raise ValueError("timestamp_utc kosong")
         makespan = (ts.max() - ts.min()).total_seconds()
         # Jika makespan 0 (misal cuma 1 request), jadikan 1 detik agar tidak error dibagi nol
         if makespan <= 0:
-            makespan = 1.0 
+            makespan = 1.0
     except Exception:
         makespan = 1.0
 
@@ -79,11 +158,12 @@ def evaluate_csv(file_path):
     throughput = total_requests / makespan
 
     # 4-5. Hitung response time (weighted per request agar relevan untuk row agregat).
-    node1_rt = pd.to_numeric(df.get('node1_response_ms'), errors='coerce').values
-    node2_rt = pd.to_numeric(df.get('node2_response_ms'), errors='coerce').values
+    node1_rt_raw = pd.to_numeric(df['node1_response_ms'], errors='coerce').to_numpy(dtype=float) if 'node1_response_ms' in df.columns else np.full(len(df), np.nan)
+    node2_rt_raw = pd.to_numeric(df['node2_response_ms'], errors='coerce').to_numpy(dtype=float) if 'node2_response_ms' in df.columns else np.full(len(df), np.nan)
 
     has_node_rt = ('node1_response_ms' in df.columns) and ('node2_response_ms' in df.columns)
-    has_node_req = ('node1_requests' in df.columns) and ('node2_requests' in df.columns)
+    node1_rt = clean_response_series_like_colab(node1_rt_raw, fallback=1.0) if has_node_rt else node1_rt_raw
+    node2_rt = clean_response_series_like_colab(node2_rt_raw, fallback=1.0) if has_node_rt else node2_rt_raw
 
     weighted_rt_values = np.array([], dtype=float)
     weighted_rt_counts = np.array([], dtype=float)
@@ -105,19 +185,28 @@ def evaluate_csv(file_path):
             weighted_rt_values = np.concatenate(rt_values_parts)
             weighted_rt_counts = np.concatenate(rt_counts_parts)
 
-    # Fallback generic single-latency-column (diasumsikan per-row mewakili 1 request)
+    # Fallback generic single-latency-column.
+    # Jika ada kolom request, bobotnya mengikuti effective_requests per row.
     if weighted_rt_values.size == 0:
-        rt_series = None
         for col in ['response_time', 'response_time_ms', 'request_latency_ms', 'latency_ms']:
             if col in df.columns:
-                rt_series = to_numeric_series(df[col])
+                rt_values_all = pd.to_numeric(df[col], errors='coerce').to_numpy(dtype=float)
+                valid_rt = ~np.isnan(rt_values_all)
+                if has_total_req or has_node_req:
+                    valid_rt = valid_rt & active_traffic_mask
+                if not np.any(valid_rt):
+                    continue
+
+                weighted_rt_values = rt_values_all[valid_rt].astype(float)
+                if has_total_req or has_node_req:
+                    weighted_rt_counts = effective_requests[valid_rt].astype(float)
+                else:
+                    weighted_rt_counts = np.ones_like(weighted_rt_values, dtype=float)
                 break
-        if rt_series is None or rt_series.empty:
+
+        if weighted_rt_values.size == 0:
             print("[ERROR] Kolom response time tidak ditemukan atau kosong.")
             return
-
-        weighted_rt_values = rt_series.values.astype(float)
-        weighted_rt_counts = np.ones_like(weighted_rt_values, dtype=float)
 
     total_rt_weight = float(np.sum(weighted_rt_counts))
     if total_rt_weight > 0:
@@ -128,38 +217,60 @@ def evaluate_csv(file_path):
     max_response_time = float(np.max(weighted_rt_values)) if weighted_rt_values.size > 0 else 0.0
     p99_response_time = weighted_percentile(weighted_rt_values, weighted_rt_counts, 99.0)
 
-    # 6. Hitung statistik CPU Aktual (Normalized)
-    if 'node1_cpu_normalized_usage' not in df.columns or 'node2_cpu_normalized_usage' not in df.columns:
+    # 6. Hitung statistik CPU Aktual (Normalized) hanya pada snapshot traffic aktif.
+    node1_cpu_col, node2_cpu_col = resolve_cpu_columns(df)
+    if node1_cpu_col is None or node2_cpu_col is None:
         print("[ERROR] Kolom CPU normalized tidak ditemukan.")
         return
-    cpu1 = pd.to_numeric(df['node1_cpu_normalized_usage'], errors='coerce').values
-    cpu2 = pd.to_numeric(df['node2_cpu_normalized_usage'], errors='coerce').values
 
-    avg_cpu1 = float(np.nanmean(cpu1)) if np.any(~np.isnan(cpu1)) else 0.0
-    avg_cpu2 = float(np.nanmean(cpu2)) if np.any(~np.isnan(cpu2)) else 0.0
+    cpu1 = (
+        pd.to_numeric(df[node1_cpu_col], errors='coerce')
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .clip(lower=0.0, upper=100.0)
+        .to_numpy(dtype=float)
+    )
+    cpu2 = (
+        pd.to_numeric(df[node2_cpu_col], errors='coerce')
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .clip(lower=0.0, upper=100.0)
+        .to_numpy(dtype=float)
+    )
+
+    cpu1_active = cpu1[active_traffic_mask]
+    cpu2_active = cpu2[active_traffic_mask]
+    if cpu1_active.size == 0 or cpu2_active.size == 0:
+        print("[ERROR] Kolom CPU normalized kosong pada snapshot traffic aktif.")
+        return
+
+    avg_cpu1 = float(np.mean(cpu1_active))
+    avg_cpu2 = float(np.mean(cpu2_active))
     avg_system_cpu = (avg_cpu1 + avg_cpu2) / 2.0
-    std_cpu1 = float(np.nanstd(cpu1, ddof=0)) if np.any(~np.isnan(cpu1)) else 0.0
-    std_cpu2 = float(np.nanstd(cpu2, ddof=0)) if np.any(~np.isnan(cpu2)) else 0.0
+    std_cpu1 = float(np.std(cpu1_active, ddof=0))
+    std_cpu2 = float(np.std(cpu2_active, ddof=0))
 
-    # 7. Hitung Keseimbangan Per Snapshot (Instantaneous DI & BCU)
-    row_avg_cpu = (cpu1 + cpu2) / 2.0
+    # 7. Hitung Keseimbangan Per Snapshot (Instantaneous DI & BCU) dalam skala 0..1.
+    balance_valid_mask, di_instant, bcu_instant = compute_di_bcu_series(cpu1, cpu2)
+    balance_valid_mask = balance_valid_mask & active_traffic_mask
 
-    valid_row = (~np.isnan(row_avg_cpu)) & (~np.isnan(cpu1)) & (~np.isnan(cpu2))
-    positive_avg = valid_row & (row_avg_cpu > 0)
-
-    di_instant = np.zeros(len(df), dtype=float)
-    di_instant[positive_avg] = np.abs(cpu1[positive_avg] - cpu2[positive_avg]) / row_avg_cpu[positive_avg]
-
-    dev1 = np.abs(cpu1 - row_avg_cpu)
-    dev2 = np.abs(cpu2 - row_avg_cpu)
-    bcu_instant = np.ones(len(df), dtype=float)
-    bcu_instant[positive_avg] = 1.0 - ((dev1[positive_avg] + dev2[positive_avg]) / (2.0 * row_avg_cpu[positive_avg]))
-    bcu_instant = np.clip(bcu_instant, 0.0, 1.0)
-
-    di_values = di_instant[valid_row]
-    bcu_values = bcu_instant[valid_row]
+    di_values = di_instant[balance_valid_mask]
+    bcu_values = bcu_instant[balance_valid_mask]
     mean_di = float(np.mean(di_values)) if di_values.size > 0 else 0.0
     mean_bcu = float(np.mean(bcu_values)) if bcu_values.size > 0 else 1.0
+    macro_di, macro_bcu = compute_macro_di_bcu(avg_cpu1, avg_cpu2)
+
+    # Base objective yang identik dengan notebook Colab:
+    # - DI: mean(abs(cpu1 - cpu2)) pada snapshot aktif
+    # - ART: mean(((rt1 * req1) + (rt2 * req2)) / effective_requests) pada snapshot aktif
+    base_di_per_row = np.abs(cpu1 - cpu2)
+    base_art_per_row = np.zeros(len(df), dtype=float)
+    base_art_per_row[active_traffic_mask] = (
+        (node1_rt[active_traffic_mask] * node1_req[active_traffic_mask]) +
+        (node2_rt[active_traffic_mask] * node2_req[active_traffic_mask])
+    ) / np.maximum(effective_requests[active_traffic_mask], 1e-9)
+    base_di = float(np.mean(base_di_per_row[active_traffic_mask])) if np.any(active_traffic_mask) else 0.0
+    base_art = float(np.mean(base_art_per_row[active_traffic_mask])) if np.any(active_traffic_mask) else 0.0
 
     # ================= CETAK LAPORAN =================
     print("=======================================================")
@@ -170,20 +281,28 @@ def evaluate_csv(file_path):
     print("-------------------------------------------------------")
     print("METRIK KINERJA (PERFORMANCE METRICS):")
     print(" 1. Makespan (Eq 2.4)  : {:.2f} detik".format(makespan))
-    print(" 2. Response Time      : {:.2f} ms".format(avg_response_time))
+    print(" 2. Response Time      : {:.2f} ms (global request-weighted)".format(avg_response_time))
     print(" 3. Throughput         : {:.2f} req/detik".format(throughput))
     print(" 4. Max RT (Global)    : {:.2f} ms".format(max_response_time))
     print(" 5. P99 RT (Global)    : {:.2f} ms".format(p99_response_time))
+    print("-------------------------------------------------------")
+    print("BASE OBJECTIVE KOMPATIBEL COLAB:")
+    print(" -> Snapshot Base Obj  : {} baris (effective_requests > 0)".format(int(active_traffic_mask.sum())))
+    print(" 6. Base DI            : {:.4f} (% CPU Gap, 0-100 scale; mean(|CPU1-CPU2|))".format(base_di))
+    print(" 7. Base ART           : {:.2f} ms (mean(((RT1*Req1)+(RT2*Req2))/effective_requests))".format(base_art))
     print("-------------------------------------------------------")
     print("METRIK KESEIMBANGAN (BALANCING METRICS):")
     print(" -> Node 1 Avg CPU     : {:.2f}%".format(avg_cpu1))
     print(" -> Node 2 Avg CPU     : {:.2f}%".format(avg_cpu2))
     print(" -> Node 1 Std Dev CPU : {:.4f} (Semakin tinggi = semakin jungkat-jungkit)".format(std_cpu1))
     print(" -> Node 2 Std Dev CPU : {:.4f} (Semakin tinggi = semakin jungkat-jungkit)".format(std_cpu2))
-    print(" -> Snapshot Valid     : {} baris".format(int(valid_row.sum())))
-    print(" 6. Res. Utilization   : {:.2f}% (Rata-rata sistem)".format(avg_system_cpu))
-    print(" 7. Mean Inst. DI      : {:.4f} (|CPU1-CPU2|/CPUavg per snapshot)".format(mean_di))
-    print(" 8. Mean Inst. BCU     : {:.4f} (Rata-rata BCU per snapshot)".format(mean_bcu))
+    print(" -> Snapshot Aktif     : {} baris (effective_requests > 0)".format(int(active_traffic_mask.sum())))
+    print(" -> Snapshot DI/BCU    : {} baris (aktif & CPU1+CPU2 > 0)".format(int(balance_valid_mask.sum())))
+    print(" 8. Res. Utilization   : {:.2f}% (Rata-rata sistem)".format(avg_system_cpu))
+    print(" 9. Mean Inst. DI Ratio: {:.4f} (0 terbaik, 1 terburuk; |CPU1-CPU2|/(CPU1+CPU2))".format(mean_di))
+    print("10. Mean Inst. BCU     : {:.4f} (1 terbaik, 0 terburuk; 1-DI per snapshot)".format(mean_bcu))
+    print("11. Macro DI Ratio     : {:.4f} (0 terbaik, 1 terburuk; |AvgCPU1-AvgCPU2|/(AvgCPU1+AvgCPU2))".format(macro_di))
+    print("12. Macro BCU          : {:.4f} (1 terbaik, 0 terburuk; 1-Macro DI)".format(macro_bcu))
     print("=======================================================")
 
 if __name__ == "__main__":
