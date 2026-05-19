@@ -15,10 +15,14 @@ LB_CONFIGS_DIR ?= $(REMOTE_BASE_DIR)/configs
 
 LOCAL_DATASET ?= $(LB_MODULE_DIR)/storage/fuzzy_training_data.csv
 LOCAL_BASE_PARAMS ?= $(LB_MODULE_DIR)/configs/base_fuzzy_params.json
-LOCAL_OPT_PARAMS ?= $(LB_MODULE_DIR)/storage/optimized_fuzzy_params.json
+LOCAL_OUTPUT_MF ?= $(LB_MODULE_DIR)/configs/fuzzy_output_mf.json
+LOCAL_OPT_PARAMS_ARTIFACT ?= $(LB_MODULE_DIR)/storage/optimized_fuzzy_params.json
+LOCAL_OPT_PARAMS_ACTIVE ?= $(LB_MODULE_DIR)/configs/optimized_fuzzy_params.json
 LOCAL_TRAIN_REPORT ?= $(LB_MODULE_DIR)/storage/mopso_offline_report.json
 
 REMOTE_DATASET ?= $(LB_STORAGE_DIR)/fuzzy_training_data.csv
+REMOTE_BASE_PARAMS ?= $(LB_CONFIGS_DIR)/base_fuzzy_params.json
+REMOTE_OUTPUT_MF ?= $(LB_CONFIGS_DIR)/fuzzy_output_mf.json
 REMOTE_OPT_PARAMS ?= $(LB_CONFIGS_DIR)/optimized_fuzzy_params.json
 
 LB_SERVICE ?= fmopso-stack_entry-point
@@ -58,7 +62,7 @@ SSH_OPTS := -i $(SSH_KEY) -p $(SSH_PORT)
 SCP_OPTS := -i $(SSH_KEY) -P $(SSH_PORT)
 REMOTE_ADDR := $(REMOTE_USER)@$(REMOTE_HOST)
 
-.PHONY: help image-build image-push image-build-push image-deploy image-update image-update-fmopso image-update-fuzzy dataset-pull dataset-capture-live capture-dataset train-mopso params-push offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source show-lb-runtime verify-capture-ready verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source locust-normal locust-spike locust-ramp manual-requests
+.PHONY: help image-build image-push image-build-push image-deploy image-update image-update-fmopso image-update-fuzzy dataset-pull dataset-capture-live capture-dataset train-mopso params-stage-local params-push params-push-all params-push-base params-push-output-mf params-push-optimized offline-flow params-pull dataset-reset-local dataset-reset-remote reset-swarm prep-fuzzy prep-mopso prep-fmopso-realtime show-lb-source show-lb-runtime verify-capture-ready verify-fuzzy verify-mopso verify-fmopso-realtime logs-lb-source locust-normal locust-spike locust-ramp manual-requests
 
 help:
 	@echo "Available targets:"
@@ -69,7 +73,7 @@ help:
 	@echo "  make dataset-capture-live # Capture dataset live dari stdout docker service logs (Ctrl+C untuk stop)"
 	@echo "  make capture-dataset  # Reset dataset di container, tunggu load test selesai, lalu ambil CSV terbaru"
 	@echo "  make train-mopso      # Training MOPSO offline di laptop"
-	@echo "  make params-push      # Push parameter optimized ke VPS (configs/optimized_fuzzy_params.json)"
+	@echo "  make params-push      # Sync base/output/optimized params ke VPS"
 	@echo "  make offline-flow     # Jalankan pull -> train -> push"
 	@echo "  make params-pull      # Ambil parameter optimized dari VPS"
 	@echo "  make dataset-reset-local"
@@ -94,7 +98,7 @@ image-push:
 
 image-build-push: image-build image-push
 
-image-deploy:
+image-deploy: params-push-all
 	ssh $(SSH_OPTS) $(REMOTE_ADDR) "\
 		docker service update --detach=true --with-registry-auth --force --image $(LB_IMAGE_REPO):$(IMAGE_TAG) $(LB_SERVICE) && \
 		docker service update --detach=true --with-registry-auth --force --image $(NODE_IMAGE_REPO):$(IMAGE_TAG) $(NODE1_SERVICE) && \
@@ -175,7 +179,8 @@ train-mopso:
 	cd $(LB_MODULE_DIR) && go run ./cmd/mopso-train \
 		-dataset $(LOCAL_DATASET) \
 		-base $(LOCAL_BASE_PARAMS) \
-		-out-params $(LOCAL_OPT_PARAMS) \
+		-output-mf $(LOCAL_OUTPUT_MF) \
+		-out-params $(LOCAL_OPT_PARAMS_ARTIFACT) \
 		-out-report $(LOCAL_TRAIN_REPORT) \
 		-particles $(MOPSO_PARTICLES) \
 		-iterations $(MOPSO_ITERATIONS) \
@@ -183,17 +188,43 @@ train-mopso:
 		-seed $(MOPSO_SEED) \
 		-runs $(MOPSO_RUNS) \
 		-allow-regression $(MOPSO_ALLOW_REGRESSION)
+	@$(MAKE) params-stage-local
 
-params-push:
-	scp $(SCP_OPTS) $(LOCAL_OPT_PARAMS) $(REMOTE_ADDR):$(REMOTE_OPT_PARAMS)
+params-stage-local:
+	@test -f $(LOCAL_OPT_PARAMS_ARTIFACT) || (echo "Missing optimized artifact: $(LOCAL_OPT_PARAMS_ARTIFACT)"; exit 1)
+	@mkdir -p $(dir $(LOCAL_OPT_PARAMS_ACTIVE))
+	cp $(LOCAL_OPT_PARAMS_ARTIFACT) $(LOCAL_OPT_PARAMS_ACTIVE)
+	@echo "Optimized params staged: $(LOCAL_OPT_PARAMS_ACTIVE)"
+
+params-push-base:
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "mkdir -p $(LB_CONFIGS_DIR)"
+	scp $(SCP_OPTS) $(LOCAL_BASE_PARAMS) $(REMOTE_ADDR):$(REMOTE_BASE_PARAMS).tmp
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "mv -f $(REMOTE_BASE_PARAMS).tmp $(REMOTE_BASE_PARAMS)"
+	@echo "Base params pushed: $(REMOTE_BASE_PARAMS)"
+
+params-push-output-mf:
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "mkdir -p $(LB_CONFIGS_DIR)"
+	scp $(SCP_OPTS) $(LOCAL_OUTPUT_MF) $(REMOTE_ADDR):$(REMOTE_OUTPUT_MF).tmp
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "mv -f $(REMOTE_OUTPUT_MF).tmp $(REMOTE_OUTPUT_MF)"
+	@echo "Output MF pushed: $(REMOTE_OUTPUT_MF)"
+
+params-push-optimized: params-stage-local
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "mkdir -p $(LB_CONFIGS_DIR)"
+	scp $(SCP_OPTS) $(LOCAL_OPT_PARAMS_ACTIVE) $(REMOTE_ADDR):$(REMOTE_OPT_PARAMS).tmp
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "mv -f $(REMOTE_OPT_PARAMS).tmp $(REMOTE_OPT_PARAMS)"
 	@echo "Optimized params pushed: $(REMOTE_OPT_PARAMS)"
 
-offline-flow: dataset-pull train-mopso params-push
+params-push-all: params-push-base params-push-output-mf params-push-optimized
+
+params-push: params-push-all
+
+offline-flow: dataset-pull train-mopso params-push-all
 
 params-pull:
-	@mkdir -p $(dir $(LOCAL_OPT_PARAMS))
-	scp $(SCP_OPTS) $(REMOTE_ADDR):$(REMOTE_OPT_PARAMS) $(LOCAL_OPT_PARAMS)
-	@echo "Optimized params pulled: $(LOCAL_OPT_PARAMS)"
+	@mkdir -p $(dir $(LOCAL_OPT_PARAMS_ARTIFACT))
+	scp $(SCP_OPTS) $(REMOTE_ADDR):$(REMOTE_OPT_PARAMS) $(LOCAL_OPT_PARAMS_ARTIFACT)
+	@$(MAKE) params-stage-local
+	@echo "Optimized params pulled: $(LOCAL_OPT_PARAMS_ARTIFACT)"
 
 dataset-reset-local:
 	rm -f $(LOCAL_DATASET)
@@ -211,17 +242,17 @@ reset-swarm:
 		sleep 5"
 	@echo "Swarm services have been force-updated and stabilized."
 
-prep-fuzzy:
+prep-fuzzy: params-push-all
 	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGORITHM --env-add LB_ALGORITHM=fuzzy --env-rm LB_ALGO --env-add LB_ALGO=fuzzy --env-rm FUZZY_PARAM_SOURCE --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=100ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --env-add FUZZY_PARAM_SOURCE=base --env-add TRAFFIC_LOG_MODE=per_hit --label-add $(LB_MODE_LABEL_KEY)=fuzzy-base $(LB_SERVICE)"
 	@$(MAKE) reset-swarm
 	@$(MAKE) verify-fuzzy
 
-prep-mopso:
-	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGORITHM --env-add LB_ALGORITHM=fuzzy --env-rm LB_ALGO --env-add LB_ALGO=fuzzy --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=optimized --env-rm TRAFFIC_LOG_MODE --env-add TRAFFIC_LOG_MODE=per_hit --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --label-add $(LB_MODE_LABEL_KEY)=mopso-optimized $(LB_SERVICE)"
+prep-mopso: params-push-all
+	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGORITHM --env-add LB_ALGORITHM=fuzzy --env-rm LB_ALGO --env-add LB_ALGO=fuzzy --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=optimized --env-rm TRAFFIC_LOG_MODE --env-add TRAFFIC_LOG_MODE=per_hit --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=100ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --label-add $(LB_MODE_LABEL_KEY)=mopso-optimized $(LB_SERVICE)"
 	@$(MAKE) reset-swarm
 	@$(MAKE) verify-mopso
 
-prep-fmopso-realtime:
+prep-fmopso-realtime: params-push-all
 	ssh $(SSH_OPTS) $(REMOTE_ADDR) "docker service update --detach=true --env-rm LB_ALGORITHM --env-add LB_ALGORITHM=fmopso --env-rm LB_ALGO --env-add LB_ALGO=fmopso --env-rm FUZZY_PARAM_SOURCE --env-add FUZZY_PARAM_SOURCE=base --env-rm TRAFFIC_LOG_MODE --env-rm MOPSO_BUSINESS_MODE --env-add MOPSO_BUSINESS_MODE=balanced --env-rm OPTIMIZER_INTERVAL --env-add OPTIMIZER_INTERVAL=1s --env-rm METRICS_INTERVAL --env-add METRICS_INTERVAL=250ms --env-rm ALGO_STATUS_LOG_INTERVAL --env-add ALGO_STATUS_LOG_INTERVAL=30s --label-add $(LB_MODE_LABEL_KEY)=fmopso-realtime $(LB_SERVICE)"
 	@$(MAKE) reset-swarm
 	@$(MAKE) verify-fmopso-realtime

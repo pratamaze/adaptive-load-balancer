@@ -7,15 +7,19 @@ import (
 
 // Engine menampung 27 parameter dinamis.
 type Engine struct {
-	mu     sync.RWMutex
-	params []float64
+	mu       sync.RWMutex
+	params   []float64
+	outputMF [3]Triple
 }
 
 // NewEngine membuat otak Fuzzy baru (Statis maupun Dinamis).
-func NewEngine(initialParams []float64) *Engine {
+func NewEngine(initialParams []float64, outputMF [3]Triple) *Engine {
 	p := make([]float64, len(initialParams))
 	copy(p, initialParams)
-	return &Engine{params: p}
+	return &Engine{
+		params:   p,
+		outputMF: outputMF,
+	}
 }
 
 // UpdateParams dipanggil oleh optimizer (PSO/MOPSO) untuk memperbarui parameter.
@@ -55,12 +59,6 @@ func (e *Engine) snapshotParams() []float64 {
 	return p
 }
 
-var MF_out = map[string]Triple{
-	"Rendah": {0, 25, 50},
-	"Sedang": {25, 50, 75},
-	"Tinggi": {50, 75, 100},
-}
-
 // CalculateMamdani menggunakan snapshot immutable parameter agar hot-reload optimizer tidak memblokir request path.
 func (e *Engine) CalculateMamdani(node NodeMetrics, rules []Rule) float64 {
 	params := e.snapshotParams()
@@ -96,23 +94,36 @@ func (e *Engine) CalculateMamdani(node NodeMetrics, rules []Rule) float64 {
 		}
 	}
 
-	triangles := [3]Triple{{0, 25, 50}, {25, 50, 75}, {50, 75, 100}}
-	var aTotal, mTotal float64
-	for i, alpha := range alphaOut {
-		if alpha <= 0 {
-			continue
+	return DefuzzifyMamdani(alphaOut, e.outputMF)
+}
+
+// DefuzzifyMamdani menyamakan jalur Go dengan training Python:
+// domain diskrit z=0..100, inferensi MIN untuk truncation, lalu union MAX.
+func DefuzzifyMamdani(alphaOut [3]float64, outputMF [3]Triple) float64 {
+	var numerator, denominator float64
+
+	for zi := 0; zi <= 100; zi++ {
+		z := float64(zi)
+		unionArea := 0.0
+
+		for i, alpha := range alphaOut {
+			if alpha <= 0 {
+				continue
+			}
+			clipped := math.Min(alpha, Fuzzify(z, outputMF[i]))
+			if clipped > unionArea {
+				unionArea = clipped
+			}
 		}
-		t := triangles[i]
-		area := alpha * (t.C - t.A) / 2
-		moment := area * (t.A + t.B + t.C) / 3
-		aTotal += area
-		mTotal += moment
+
+		numerator += z * unionArea
+		denominator += unionArea
 	}
 
-	if aTotal == 0 {
+	if denominator == 0 {
 		return 0
 	}
-	return mTotal / aTotal
+	return numerator / denominator
 }
 
 func labelToIndex(label string) int {

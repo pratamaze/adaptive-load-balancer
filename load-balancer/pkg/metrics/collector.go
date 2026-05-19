@@ -13,7 +13,9 @@ import (
 )
 
 type cpuTelemetryPayload struct {
-	CPUPercent float64 `json:"cpu_percent"`
+	CPUPercent      float64 `json:"cpu_percent"`
+	SampledAtUnix   int64   `json:"sampled_at_unix"`
+	SampledAtUnixMS int64   `json:"sampled_at_unix_ms"`
 }
 
 var firstMetricCollectedOnce sync.Once
@@ -45,11 +47,15 @@ func StartCollector(nodes []*lbtypes.BackendNode, interval time.Duration, paramP
 		retryDelay = 200 * time.Millisecond
 	}
 
+	cpuStaleAfter := maxDuration(1500*time.Millisecond, interval*3)
+	cpuDecayWindow := maxDuration(6*time.Second, interval*12)
+	telemetryFreshnessTTL := maxDuration(2500*time.Millisecond, interval*10)
+
 	attempt := 0
 	for {
 		attempt++
-		successCount := updateAllMetrics(nodes, client, paramProfile)
-		if successCount > 0 {
+		successCount := updateAllMetrics(nodes, client, paramProfile, cpuStaleAfter, cpuDecayWindow, telemetryFreshnessTTL)
+		if successCount == validNodes {
 			log.Printf(
 				"[METRIC] Initial pull selesai (%d/%d node sukses) src=%s attempt=%d",
 				successCount,
@@ -60,7 +66,9 @@ func StartCollector(nodes []*lbtypes.BackendNode, interval time.Duration, paramP
 			break
 		}
 		log.Printf(
-			"[METRIC] Initial pull belum sukses, retry dalam %s src=%s attempt=%d",
+			"[METRIC] Initial pull belum lengkap (%d/%d node sukses), retry dalam %s src=%s attempt=%d",
+			successCount,
+			validNodes,
 			retryDelay,
 			activeParamProfile(paramProfile),
 			attempt,
@@ -73,12 +81,12 @@ func StartCollector(nodes []*lbtypes.BackendNode, interval time.Duration, paramP
 		defer ticker.Stop()
 
 		for range ticker.C {
-			updateAllMetrics(nodes, client, paramProfile)
+			updateAllMetrics(nodes, client, paramProfile, cpuStaleAfter, cpuDecayWindow, telemetryFreshnessTTL)
 		}
 	}()
 }
 
-func updateAllMetrics(nodes []*lbtypes.BackendNode, client *http.Client, paramProfile string) int {
+func updateAllMetrics(nodes []*lbtypes.BackendNode, client *http.Client, paramProfile string, cpuStaleAfter, cpuDecayWindow, telemetryFreshnessTTL time.Duration) int {
 	var wg sync.WaitGroup
 	var successCount atomic.Int32
 	for _, node := range nodes {
@@ -88,7 +96,7 @@ func updateAllMetrics(nodes []*lbtypes.BackendNode, client *http.Client, paramPr
 		wg.Add(1)
 		go func(n *lbtypes.BackendNode) {
 			defer wg.Done()
-			if collectNodeCPUMetric(n, client, paramProfile) {
+			if collectNodeCPUMetric(n, client, paramProfile, cpuStaleAfter, cpuDecayWindow, telemetryFreshnessTTL) {
 				successCount.Add(1)
 			}
 		}(node)
@@ -97,7 +105,7 @@ func updateAllMetrics(nodes []*lbtypes.BackendNode, client *http.Client, paramPr
 	return int(successCount.Load())
 }
 
-func collectNodeCPUMetric(node *lbtypes.BackendNode, client *http.Client, paramProfile string) bool {
+func collectNodeCPUMetric(node *lbtypes.BackendNode, client *http.Client, paramProfile string, cpuStaleAfter, cpuDecayWindow, telemetryFreshnessTTL time.Duration) bool {
 	if node == nil || node.URL == nil || client == nil {
 		return false
 	}
@@ -105,19 +113,43 @@ func collectNodeCPUMetric(node *lbtypes.BackendNode, client *http.Client, paramP
 	telemetryURL := strings.TrimRight(node.URL.String(), "/") + "/telemetry/cpu"
 	resp, err := client.Get(telemetryURL)
 	if err != nil {
+		publishCPUState(node, cpuStaleAfter, cpuDecayWindow)
 		log.Printf("[METRIC][SRC=%s] Gagal ambil telemetry CPU dari %s: %v", activeParamProfile(paramProfile), node.Name, err)
 		return false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		publishCPUState(node, cpuStaleAfter, cpuDecayWindow)
 		log.Printf("[METRIC][SRC=%s] Telemetry CPU %s mengembalikan status=%d", activeParamProfile(paramProfile), node.Name, resp.StatusCode)
 		return false
 	}
 
 	var payload cpuTelemetryPayload
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		publishCPUState(node, cpuStaleAfter, cpuDecayWindow)
 		log.Printf("[METRIC][SRC=%s] Gagal decode telemetry CPU %s: %v", activeParamProfile(paramProfile), node.Name, err)
+		return false
+	}
+	sampledAt := telemetrySampleTime(payload)
+	if sampledAt.IsZero() {
+		publishCPUState(node, cpuStaleAfter, cpuDecayWindow)
+		log.Printf("[METRIC][SRC=%s] Telemetry CPU %s belum punya sample valid", activeParamProfile(paramProfile), node.Name)
+		return false
+	}
+	sampleAge := time.Since(sampledAt)
+	if sampleAge < 0 {
+		sampleAge = 0
+	}
+	if telemetryFreshnessTTL > 0 && sampleAge > telemetryFreshnessTTL {
+		publishCPUState(node, cpuStaleAfter, cpuDecayWindow)
+		log.Printf(
+			"[METRIC][SRC=%s] Telemetry CPU %s stale age=%s ttl=%s",
+			activeParamProfile(paramProfile),
+			node.Name,
+			sampleAge,
+			telemetryFreshnessTTL,
+		)
 		return false
 	}
 
@@ -131,6 +163,7 @@ func collectNodeCPUMetric(node *lbtypes.BackendNode, client *http.Client, paramP
 
 	nodeSnapshot := node.SnapshotForDecision()
 	node.UpdateCPU(cpuPct, nodeSnapshot.CPUCap)
+	publishCPUState(node, cpuStaleAfter, cpuDecayWindow)
 	firstMetricCollectedOnce.Do(func() {
 		firstAt := node.LastCPUObservedAt().UTC()
 		log.Printf(
@@ -143,6 +176,69 @@ func collectNodeCPUMetric(node *lbtypes.BackendNode, client *http.Client, paramP
 		)
 	})
 	return true
+}
+
+func telemetrySampleTime(payload cpuTelemetryPayload) time.Time {
+	if payload.SampledAtUnixMS > 0 {
+		return time.UnixMilli(payload.SampledAtUnixMS)
+	}
+	if payload.SampledAtUnix > 0 {
+		return time.Unix(payload.SampledAtUnix, 0)
+	}
+	return time.Time{}
+}
+
+func publishCPUState(node *lbtypes.BackendNode, staleAfter, decayWindow time.Duration) {
+	if node == nil {
+		return
+	}
+
+	snap := node.SnapshotForDecision()
+	cpu := clampCPU(snap.CPU)
+	lastObserved := node.LastCPUObservedAt()
+	if !lastObserved.IsZero() {
+		cpu = decayToBaseline(cpu, 0.0, time.Since(lastObserved), staleAfter, decayWindow)
+	}
+
+	SetFuzzyInputCPU(
+		NodeLabel(node.Name),
+		lbtypes.CalculateNormalizedCPU(cpu, snap.CPUCap),
+	)
+}
+
+func decayToBaseline(value, baseline float64, age, staleAfter, decayWindow time.Duration) float64 {
+	if value <= 0 {
+		return baseline
+	}
+	if staleAfter <= 0 || age <= staleAfter {
+		return value
+	}
+	elapsed := age - staleAfter
+	if decayWindow <= 0 || elapsed >= decayWindow {
+		return baseline
+	}
+	ratio := 1.0 - (float64(elapsed) / float64(decayWindow))
+	if ratio < 0 {
+		ratio = 0
+	}
+	return baseline + ((value - baseline) * ratio)
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a >= b {
+		return a
+	}
+	return b
+}
+
+func clampCPU(v float64) float64 {
+	if v <= 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
 }
 
 func activeParamProfile(profile string) string {

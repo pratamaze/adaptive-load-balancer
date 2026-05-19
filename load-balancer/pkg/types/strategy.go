@@ -150,6 +150,13 @@ type DecisionSnapshot struct {
 	NodeSnapshots   []BackendNode `json:"-"`
 }
 
+// ResponseSample adalah event Data Plane saat satu request selesai diproses.
+// Worker CSV memakai event ini untuk menghitung latency window per node.
+type ResponseSample struct {
+	NodeName  string
+	LatencyMS float64
+}
+
 // BalancerStrategy mengenkapsulasi logika pemilihan node backend.
 type BalancerStrategy interface {
 	SelectNode(nodes []BackendNode, snapshot *DecisionSnapshot) *BackendNode

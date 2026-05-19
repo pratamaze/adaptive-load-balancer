@@ -1,6 +1,7 @@
 package mopso
 
 import (
+	"load-balancer/pkg/algorithm/fuzzy"
 	"math"
 	"math/rand"
 	"sort"
@@ -8,7 +9,7 @@ import (
 )
 
 const (
-	Dimensions   = 27
+	Dimensions   = fuzzy.ParamCount
 	NumParticles = 20
 	Iterations   = 1900
 	maxArchive   = 128
@@ -77,9 +78,10 @@ type evaluator struct {
 	costPerReq [2]float64
 	cpuForFuzz [2]float64
 	capacity   [2]float64
+	outputMF   [3]fuzzy.Triple
 }
 
-func newEvaluator(snap HistoricalSnapshot) evaluator {
+func newEvaluator(snap HistoricalSnapshot, outputMF [3]fuzzy.Triple) evaluator {
 	cap1 := snap.Node1.CPUCapacity
 	if cap1 <= 0 {
 		cap1 = 100
@@ -107,12 +109,13 @@ func newEvaluator(snap HistoricalSnapshot) evaluator {
 		costPerReq: [2]float64{c1, c2},
 		cpuForFuzz: [2]float64{toNormalizedCPU(snap.Node1.CPUUsage, cap1), toNormalizedCPU(snap.Node2.CPUUsage, cap2)},
 		capacity:   [2]float64{cap1, cap2},
+		outputMF:   outputMF,
 	}
 }
 
 func (e evaluator) evaluate(params []float64) (Objective, float64, float64) {
-	score1 := fuzzyScore(params, e.cpuForFuzz[0], e.snap.Node1.QueueLength, e.snap.Node1.ResponseTime)
-	score2 := fuzzyScore(params, e.cpuForFuzz[1], e.snap.Node2.QueueLength, e.snap.Node2.ResponseTime)
+	score1 := fuzzyScore(params, e.outputMF, e.cpuForFuzz[0], e.snap.Node1.QueueLength, e.snap.Node1.ResponseTime)
+	score2 := fuzzyScore(params, e.outputMF, e.cpuForFuzz[1], e.snap.Node2.QueueLength, e.snap.Node2.ResponseTime)
 	totalScore := score1 + score2
 	share1 := 0.5
 	if totalScore > 0 {
@@ -179,8 +182,8 @@ func (e evaluator) evaluate(params []float64) (Objective, float64, float64) {
 }
 
 // OptimizeReplay menjalankan F-MOPSO murni dari historical replay 5 detik terakhir.
-func OptimizeReplay(baseParams []float64, snap HistoricalSnapshot) ParetoResult {
-	eval := newEvaluator(snap)
+func OptimizeReplay(baseParams []float64, outputMF [3]fuzzy.Triple, snap HistoricalSnapshot) ParetoResult {
+	eval := newEvaluator(snap, outputMF)
 	result := ParetoResult{
 		TotalRequest: eval.totalReq,
 		CostPerReq1:  eval.costPerReq[0],
@@ -654,7 +657,7 @@ func enforcePeakOrder(params []float64, start int, minGap, hi float64) {
 
 // ---- Fast fuzzy scoring (allocation-free path) ----
 
-func fuzzyScore(params []float64, cpu, q, rt float64) float64 {
+func fuzzyScore(params []float64, outputMF [3]fuzzy.Triple, cpu, q, rt float64) float64 {
 	muCPU0 := fuzzifyLeft(cpu, params[0], params[1], params[2])
 	muCPU1 := fuzzifyTriangle(cpu, params[3], params[4], params[5])
 	muCPU2 := fuzzifyRight(cpu, params[6], params[7], params[8])
@@ -679,22 +682,7 @@ func fuzzyScore(params []float64, cpu, q, rt float64) float64 {
 			alphaOut[r.out] = a
 		}
 	}
-
-	var aTotal, mTotal float64
-	for out, alpha := range alphaOut {
-		if alpha <= 0 {
-			continue
-		}
-		tri := outMF[out]
-		area := alpha * (tri[2] - tri[0]) / 2
-		moment := area * (tri[0] + tri[1] + tri[2]) / 3
-		aTotal += area
-		mTotal += moment
-	}
-	if aTotal == 0 {
-		return 0
-	}
-	return mTotal / aTotal
+	return fuzzy.DefuzzifyMamdani(alphaOut, outputMF)
 }
 
 func fuzzifyLeft(v, a, b, c float64) float64 {
@@ -771,6 +759,3 @@ var compiledRules = [...]ruleIdx{
 	{1, 0, 0, 2}, {1, 0, 1, 1}, {1, 0, 2, 1}, {1, 1, 0, 1}, {1, 1, 1, 1}, {1, 1, 2, 0}, {1, 2, 0, 1}, {1, 2, 1, 0}, {1, 2, 2, 0},
 	{2, 0, 0, 1}, {2, 0, 1, 1}, {2, 0, 2, 0}, {2, 1, 0, 1}, {2, 1, 1, 0}, {2, 1, 2, 0}, {2, 2, 0, 0}, {2, 2, 1, 0}, {2, 2, 2, 0},
 }
-
-// outMF index: 0=Rendah, 1=Sedang, 2=Tinggi
-var outMF = [...][3]float64{{0, 25, 50}, {25, 50, 75}, {50, 75, 100}}

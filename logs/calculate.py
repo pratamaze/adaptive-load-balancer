@@ -6,6 +6,8 @@ import warnings
 # Matikan warning dari pandas biar output terminal bersih
 warnings.filterwarnings('ignore')
 
+NORMALIZED_CPU_CAPACITY = 100.0
+
 def find_column(lower_to_original, aliases):
     for alias in aliases:
         key = alias.strip().lower()
@@ -66,6 +68,18 @@ def resolve_cpu_columns(df):
     ])
     return node1_col, node2_col
 
+def resolve_raw_cpu_columns(df):
+    lower_to_original = {name.strip().lower(): name for name in df.columns}
+    node1_col = find_column(lower_to_original, [
+        'node1_cpu_raw_usage',
+        'node1_cpu_usage_raw',
+    ])
+    node2_col = find_column(lower_to_original, [
+        'node2_cpu_raw_usage',
+        'node2_cpu_usage_raw',
+    ])
+    return node1_col, node2_col
+
 def clean_response_series_like_colab(values, fallback=1.0):
     """
     Samakan perilaku notebook Colab:
@@ -83,11 +97,10 @@ def clean_response_series_like_colab(values, fallback=1.0):
     return numeric.to_numpy(dtype=float)
 
 def compute_di_bcu_series(cpu1, cpu2):
-    total_cpu = cpu1 + cpu2
-    valid = (~np.isnan(cpu1)) & (~np.isnan(cpu2)) & (total_cpu > 0)
+    valid = (~np.isnan(cpu1)) & (~np.isnan(cpu2))
 
     di_values = np.zeros(len(cpu1), dtype=float)
-    di_values[valid] = np.abs(cpu1[valid] - cpu2[valid]) / total_cpu[valid]
+    di_values[valid] = np.abs(cpu1[valid] - cpu2[valid]) / NORMALIZED_CPU_CAPACITY
     di_values = np.clip(di_values, 0.0, 1.0)
 
     bcu_values = np.ones(len(cpu1), dtype=float)
@@ -96,14 +109,13 @@ def compute_di_bcu_series(cpu1, cpu2):
     return valid, di_values, bcu_values
 
 def compute_macro_di_bcu(avg_cpu1, avg_cpu2):
-    total_cpu = avg_cpu1 + avg_cpu2
-    if total_cpu <= 0:
-        return 0.0, 1.0
-
-    macro_di = abs(avg_cpu1 - avg_cpu2) / total_cpu
+    macro_di = abs(avg_cpu1 - avg_cpu2) / NORMALIZED_CPU_CAPACITY
     macro_di = float(np.clip(macro_di, 0.0, 1.0))
     macro_bcu = float(np.clip(1.0 - macro_di, 0.0, 1.0))
     return macro_di, macro_bcu
+
+def count_positive_request_zero_cpu_rows(node_req, cpu_values):
+    return int(np.sum((node_req > 0) & (cpu_values <= 0)))
 
 def weighted_percentile(values, weights, percentile):
     """Hitung persentil berbobot tanpa mengulang array (kompatibel numpy lama)."""
@@ -251,6 +263,8 @@ def evaluate_csv(file_path):
     std_cpu2 = float(np.std(cpu2_active, ddof=0))
 
     # 7. Hitung Keseimbangan Per Snapshot (Instantaneous DI & BCU) dalam skala 0..1.
+    # Karena CPU sudah normalized terhadap kapasitas masing-masing (0..100),
+    # selisih maksimum antarnode adalah 100.
     balance_valid_mask, di_instant, bcu_instant = compute_di_bcu_series(cpu1, cpu2)
     balance_valid_mask = balance_valid_mask & active_traffic_mask
 
@@ -261,15 +275,14 @@ def evaluate_csv(file_path):
     macro_di, macro_bcu = compute_macro_di_bcu(avg_cpu1, avg_cpu2)
 
     # Base objective yang identik dengan notebook Colab:
-    # - DI: mean(abs(cpu1 - cpu2)) pada snapshot aktif
+    # - DI: mean(abs(cpu1 - cpu2) / 100.0) pada snapshot aktif
     # - ART: mean(((rt1 * req1) + (rt2 * req2)) / effective_requests) pada snapshot aktif
-    base_di_per_row = np.abs(cpu1 - cpu2)
     base_art_per_row = np.zeros(len(df), dtype=float)
     base_art_per_row[active_traffic_mask] = (
         (node1_rt[active_traffic_mask] * node1_req[active_traffic_mask]) +
         (node2_rt[active_traffic_mask] * node2_req[active_traffic_mask])
     ) / np.maximum(effective_requests[active_traffic_mask], 1e-9)
-    base_di = float(np.mean(base_di_per_row[active_traffic_mask])) if np.any(active_traffic_mask) else 0.0
+    base_di = float(np.mean(di_instant[balance_valid_mask])) if di_values.size > 0 else 0.0
     base_art = float(np.mean(base_art_per_row[active_traffic_mask])) if np.any(active_traffic_mask) else 0.0
 
     # ================= CETAK LAPORAN =================
@@ -288,7 +301,7 @@ def evaluate_csv(file_path):
     print("-------------------------------------------------------")
     print("BASE OBJECTIVE KOMPATIBEL COLAB:")
     print(" -> Snapshot Base Obj  : {} baris (effective_requests > 0)".format(int(active_traffic_mask.sum())))
-    print(" 6. Base DI            : {:.4f} (% CPU Gap, 0-100 scale; mean(|CPU1-CPU2|))".format(base_di))
+    print(" 6. Base DI            : {:.4f} (capacity-normalized; mean(|CPU1-CPU2|/100))".format(base_di))
     print(" 7. Base ART           : {:.2f} ms (mean(((RT1*Req1)+(RT2*Req2))/effective_requests))".format(base_art))
     print("-------------------------------------------------------")
     print("METRIK KESEIMBANGAN (BALANCING METRICS):")
@@ -297,11 +310,11 @@ def evaluate_csv(file_path):
     print(" -> Node 1 Std Dev CPU : {:.4f} (Semakin tinggi = semakin jungkat-jungkit)".format(std_cpu1))
     print(" -> Node 2 Std Dev CPU : {:.4f} (Semakin tinggi = semakin jungkat-jungkit)".format(std_cpu2))
     print(" -> Snapshot Aktif     : {} baris (effective_requests > 0)".format(int(active_traffic_mask.sum())))
-    print(" -> Snapshot DI/BCU    : {} baris (aktif & CPU1+CPU2 > 0)".format(int(balance_valid_mask.sum())))
+    print(" -> Snapshot DI/BCU    : {} baris (aktif & CPU normalized tersedia)".format(int(balance_valid_mask.sum())))
     print(" 8. Res. Utilization   : {:.2f}% (Rata-rata sistem)".format(avg_system_cpu))
-    print(" 9. Mean Inst. DI Ratio: {:.4f} (0 terbaik, 1 terburuk; |CPU1-CPU2|/(CPU1+CPU2))".format(mean_di))
+    print(" 9. Mean Inst. DI Ratio: {:.4f} (0 terbaik, 1 terburuk; |CPU1-CPU2|/100)".format(mean_di))
     print("10. Mean Inst. BCU     : {:.4f} (1 terbaik, 0 terburuk; 1-DI per snapshot)".format(mean_bcu))
-    print("11. Macro DI Ratio     : {:.4f} (0 terbaik, 1 terburuk; |AvgCPU1-AvgCPU2|/(AvgCPU1+AvgCPU2))".format(macro_di))
+    print("11. Macro DI Ratio     : {:.4f} (0 terbaik, 1 terburuk; |AvgCPU1-AvgCPU2|/100)".format(macro_di))
     print("12. Macro BCU          : {:.4f} (1 terbaik, 0 terburuk; 1-Macro DI)".format(macro_bcu))
     print("=======================================================")
 

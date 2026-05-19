@@ -17,17 +17,13 @@ import (
 	"time"
 
 	"load-balancer/cmd/mopso-train/internal/mopso"
+	"load-balancer/pkg/algorithm/fuzzy"
 )
-
-var defaultBaseParams = []float64{
-	0, 40, 75, 60, 80, 95, 85, 95, 100,
-	0, 50, 150, 100, 250, 400, 300, 500, 1000,
-	0, 150, 300, 200, 500, 800, 600, 850, 1000,
-}
 
 func main() {
 	datasetPath := flag.String("dataset", "storage/fuzzy_training_data.csv", "path CSV dataset training dari fuzzy runtime")
 	basePath := flag.String("base", "configs/base_fuzzy_params.json", "path JSON base parameter fuzzy")
+	outputMFPath := flag.String("output-mf", "configs/fuzzy_output_mf.json", "path JSON membership function output fuzzy")
 	outParams := flag.String("out-params", "storage/optimized_fuzzy_params.json", "output JSON parameter terbaik")
 	outReport := flag.String("out-report", "storage/mopso_offline_report.json", "output JSON ringkasan hasil training")
 	particles := flag.Int("particles", 30, "jumlah partikel MOPSO")
@@ -38,14 +34,17 @@ func main() {
 	allowRegression := flag.Bool("allow-regression", false, "izinkan hasil optimasi yang tidak mengalahkan base objective")
 	flag.Parse()
 
-	samples, err := loadOfflineSamples(*datasetPath)
-	if err != nil {
-		fatalf("gagal baca dataset: %v", err)
-	}
-
 	baseParams, err := loadBaseParams(*basePath)
 	if err != nil {
 		fatalf("gagal baca base params: %v", err)
+	}
+	outputMF, err := loadOutputMF(*outputMFPath)
+	if err != nil {
+		fatalf("gagal baca output MF: %v", err)
+	}
+	samples, err := loadOfflineSamples(*datasetPath)
+	if err != nil {
+		fatalf("gagal baca dataset: %v", err)
 	}
 
 	totalRuns := *runs
@@ -79,7 +78,7 @@ func main() {
 			InitialSpread: *spread,
 			Seed:          runSeed,
 		}
-		result, err := mopso.OptimizeOffline(samples, baseParams, cfg)
+		result, err := mopso.OptimizeOffline(samples, baseParams, outputMF, cfg)
 		if err != nil {
 			summaries = append(summaries, runSummary{
 				RunIndex: i + 1,
@@ -152,11 +151,11 @@ func main() {
 		fatalf("hasil parameter tidak valid")
 	}
 
-	optimizedObj, err := mopso.EvaluateOfflineObjective(result.BestBalanced.Params, samples)
+	optimizedObj, err := mopso.EvaluateOfflineObjective(result.BestBalanced.Params, outputMF, samples)
 	if err != nil {
 		fatalf("gagal evaluasi objective optimized: %v", err)
 	}
-	baseObj, err := mopso.EvaluateOfflineObjective(baseParams, samples)
+	baseObj, err := mopso.EvaluateOfflineObjective(baseParams, outputMF, samples)
 	if err != nil {
 		fatalf("gagal evaluasi objective base: %v", err)
 	}
@@ -535,9 +534,6 @@ func loadOfflineSamples(path string) ([]mopso.OfflineSample, error) {
 func loadBaseParams(path string) ([]float64, error) {
 	buf, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return append([]float64(nil), defaultBaseParams...), nil
-		}
 		return nil, err
 	}
 
@@ -545,10 +541,18 @@ func loadBaseParams(path string) ([]float64, error) {
 	if err := json.Unmarshal(buf, &params); err != nil {
 		return nil, err
 	}
-	if len(params) != mopso.Dimensions {
+	if len(params) != fuzzy.ParamCount {
 		return nil, fmt.Errorf("panjang base params harus %d, dapat %d", mopso.Dimensions, len(params))
 	}
 	return params, nil
+}
+
+func loadOutputMF(path string) ([3]fuzzy.Triple, error) {
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		return [3]fuzzy.Triple{}, err
+	}
+	return fuzzy.ParseOutputMFConfig(buf)
 }
 
 func saveJSON(path string, payload any) error {

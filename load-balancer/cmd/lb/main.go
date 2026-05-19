@@ -36,9 +36,10 @@ func main() {
 	}
 
 	decisionSnapshotC := dataset.NewSnapshotChannel(cfg.DecisionSnapshotBuffer)
+	responseSampleC := dataset.NewResponseSampleChannel(cfg.DecisionSnapshotBuffer)
 
 	metrics.StartCollector(cfg.BackendNodes, cfg.MetricsInterval, cfg.Fuzzy.ParamProfile)
-	go dataset.StartWorker("storage/fuzzy_training_data.csv", decisionSnapshotC, cfg.Algorithm, cfg.TrafficLogMode)
+	go dataset.StartWorker("storage/fuzzy_training_data.csv", cfg.BackendNodes, decisionSnapshotC, responseSampleC, cfg.Algorithm, cfg.TrafficLogMode)
 	go func() {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", promhttp.Handler())
@@ -58,6 +59,7 @@ func main() {
 		AlgoLogInterval:   cfg.AlgoLogInterval,
 		ActiveStrategy:    activeStrategy,
 		DecisionSnapshotC: decisionSnapshotC,
+		ResponseSampleC:   responseSampleC,
 	})
 
 	if cfg.TrafficLogMode != config.TrafficLogModePerHit {

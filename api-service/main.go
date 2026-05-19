@@ -21,8 +21,10 @@ import (
 var nodeName string
 var hostName string
 var telemetryState = struct {
-	mu         sync.RWMutex
-	cpuPercent float64
+	mu              sync.RWMutex
+	cpuPercent      float64
+	sampledAtUnixMS int64
+	hasSample       bool
 }{}
 
 func init() {
@@ -41,9 +43,10 @@ type ResponseData struct {
 }
 
 type CPUTelemetryResponse struct {
-	NodeName      string  `json:"node_name"`
-	CPUPercent    float64 `json:"cpu_percent"`
-	SampledAtUnix int64   `json:"sampled_at_unix"`
+	NodeName        string  `json:"node_name"`
+	CPUPercent      float64 `json:"cpu_percent"`
+	SampledAtUnix   int64   `json:"sampled_at_unix"`
+	SampledAtUnixMS int64   `json:"sampled_at_unix_ms"`
 }
 
 func startCPUTelemetrySampler() {
@@ -63,8 +66,11 @@ func startCPUTelemetrySampler() {
 			if v > 100 {
 				v = 100
 			}
+			now := time.Now().UnixMilli()
 			telemetryState.mu.Lock()
 			telemetryState.cpuPercent = v
+			telemetryState.sampledAtUnixMS = now
+			telemetryState.hasSample = true
 			telemetryState.mu.Unlock()
 		}
 	}()
@@ -77,14 +83,21 @@ func cpuTelemetryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	telemetryState.mu.RLock()
 	cpuPercent := telemetryState.cpuPercent
+	sampledAtUnixMS := telemetryState.sampledAtUnixMS
+	hasSample := telemetryState.hasSample
 	telemetryState.mu.RUnlock()
+	if !hasSample || sampledAtUnixMS <= 0 {
+		http.Error(w, "CPU telemetry belum siap", http.StatusServiceUnavailable)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(CPUTelemetryResponse{
-		NodeName:      nodeName,
-		CPUPercent:    cpuPercent,
-		SampledAtUnix: time.Now().Unix(),
+		NodeName:        nodeName,
+		CPUPercent:      cpuPercent,
+		SampledAtUnix:   sampledAtUnixMS / 1000,
+		SampledAtUnixMS: sampledAtUnixMS,
 	})
 }
 

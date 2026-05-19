@@ -1,13 +1,13 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	baseFuzzyParamsPath = "configs/base_fuzzy_params.json"
-	optimizedFuzzyPath  = "storage/optimized_fuzzy_params.json"
+	baseFuzzyParamsPath      = "configs/base_fuzzy_params.json"
+	optimizedFuzzyParamsPath = "configs/optimized_fuzzy_params.json"
+	outputFuzzyMFPath        = "configs/fuzzy_output_mf.json"
 
 	TrafficLogModeWindow = "window"
 	TrafficLogModePerHit = "per_hit"
@@ -26,12 +27,6 @@ const (
 	defaultNode1CPUCapacity = 100.0
 	defaultNode2CPUCapacity = 50.0
 )
-
-var DefaultBaseFuzzyParams = []float64{
-	0, 40, 75, 60, 80, 95, 85, 95, 100,
-	0, 50, 150, 100, 250, 400, 300, 500, 1000,
-	0, 150, 300, 200, 500, 800, 600, 850, 1000,
-}
 
 var DefaultRules = []fuzzy.Rule{
 	{CPULabel: "Rendah", QueueLabel: "Rendah", RespLabel: "Cepat", OutputLabel: "Tinggi"},
@@ -83,19 +78,40 @@ type RuntimeConfig struct {
 func Load() (RuntimeConfig, error) {
 	ensureDirs("configs", "storage")
 
-	algorithm := normalizeAlgorithm(envLowerAliases([]string{"LB_ALGORITHM", "LB_ALGO"}, "fuzzy_base"))
-	trafficLogMode := normalizeTrafficLogMode(envLower("TRAFFIC_LOG_MODE", TrafficLogModePerHit))
+	algorithm, err := parseAlgorithm(envLowerAliases([]string{"LB_ALGORITHM", "LB_ALGO"}, "fuzzy"))
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
+	paramSource, err := parseFuzzyParamSource(envLower("FUZZY_PARAM_SOURCE", "base"))
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
+	trafficLogMode, err := parseTrafficLogMode(envLower("TRAFFIC_LOG_MODE", TrafficLogModePerHit))
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
+	metricsInterval, err := envDurationMSStrict("METRICS_INTERVAL", 50*time.Millisecond)
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
+	algoLogInterval, err := envDurationMSStrict("ALGO_STATUS_LOG_INTERVAL", 30*time.Second)
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
 	backendNodes, err := initBackendNodes([]string{"http://api-node1:8080", "http://api-node2:8080"})
 	if err != nil {
 		return RuntimeConfig{}, err
 	}
-	fuzzyBootstrap := initializeFuzzyEngines(algorithm, normalizeFuzzyParamSource(envLower("FUZZY_PARAM_SOURCE", "base")))
+	fuzzyBootstrap, err := initializeFuzzyEngines(algorithm, paramSource)
+	if err != nil {
+		return RuntimeConfig{}, err
+	}
 
 	return RuntimeConfig{
 		Algorithm:              algorithm,
 		TrafficLogMode:         trafficLogMode,
-		MetricsInterval:        envDurationMS("METRICS_INTERVAL", 50*time.Millisecond),
-		AlgoLogInterval:        envDurationMS("ALGO_STATUS_LOG_INTERVAL", 30*time.Second),
+		MetricsInterval:        metricsInterval,
+		AlgoLogInterval:        algoLogInterval,
 		ListenAddr:             ":8080",
 		BackendNodes:           backendNodes,
 		DecisionSnapshotBuffer: 2048,
@@ -129,54 +145,50 @@ func envLowerAliases(keys []string, fallback string) string {
 	return fallback
 }
 
-func envDurationMS(key string, fallback time.Duration) time.Duration {
+func envDurationMSStrict(key string, fallback time.Duration) (time.Duration, error) {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
-		return fallback
+		return fallback, nil
 	}
-	ms, err := time.ParseDuration(raw)
-	if err == nil {
-		return ms
+	if value, err := time.ParseDuration(raw); err == nil {
+		return value, nil
 	}
-	if n, convErr := time.ParseDuration(raw + "ms"); convErr == nil {
-		return n
+	if value, err := time.ParseDuration(raw + "ms"); err == nil {
+		return value, nil
 	}
-	return fallback
+	return 0, fmt.Errorf("%s=%q tidak valid", key, raw)
 }
 
-func normalizeAlgorithm(value string) string {
+func parseAlgorithm(value string) (string, error) {
 	switch value {
 	case "rr", "roundrobin":
-		return "rr"
+		return "rr", nil
 	case "fuzzy_base", "fuzzy":
-		return "fuzzy_base"
+		return "fuzzy_base", nil
 	case "fuzzy_mopso", "fmopso":
-		return "fuzzy_mopso"
+		return "fuzzy_mopso", nil
 	default:
-		log.Printf("[WARNING] LB_ALGORITHM tidak valid (%s), fallback ke fuzzy_base", value)
-		return "fuzzy_base"
+		return "", fmt.Errorf("LB_ALGORITHM tidak valid: %s", value)
 	}
 }
 
-func normalizeTrafficLogMode(value string) string {
+func parseTrafficLogMode(value string) (string, error) {
 	switch value {
 	case TrafficLogModeWindow, TrafficLogModePerHit:
-		return value
+		return value, nil
 	default:
-		log.Printf("[WARNING] TRAFFIC_LOG_MODE tidak dikenal (%s), fallback ke %s", value, TrafficLogModeWindow)
-		return TrafficLogModeWindow
+		return "", fmt.Errorf("TRAFFIC_LOG_MODE tidak dikenal: %s", value)
 	}
 }
 
-func normalizeFuzzyParamSource(value string) string {
+func parseFuzzyParamSource(value string) (string, error) {
 	switch value {
-	case "", "base":
-		return "base"
+	case "base":
+		return "base", nil
 	case "optimized", "mopso":
-		return "optimized"
+		return "optimized", nil
 	default:
-		log.Printf("[WARNING] FUZZY_PARAM_SOURCE tidak dikenal (%s), fallback ke base", value)
-		return "base"
+		return "", fmt.Errorf("FUZZY_PARAM_SOURCE tidak dikenal: %s", value)
 	}
 }
 
@@ -205,7 +217,6 @@ func resolveNodeCPUCapacity(index int, nodeName string) float64 {
 			return value
 		}
 	}
-	// Fallback kompatibilitas: CPU_LIMIT_PERCENT tunggal dipakai untuk node1.
 	if index == 0 {
 		if value, ok := readCPUCapacityEnv("CPU_LIMIT_PERCENT"); ok {
 			return value
@@ -237,122 +248,90 @@ func readCPUCapacityEnv(key string) (float64, bool) {
 	return value, true
 }
 
-func initializeFuzzyEngines(algorithm, paramSource string) FuzzyBootstrap {
-	ensureBaseParamsFile(baseFuzzyParamsPath, DefaultBaseFuzzyParams)
-	baseParams := loadFloatArrayWithFallback(baseFuzzyParamsPath, DefaultBaseFuzzyParams, "base fuzzy params")
-	baseParams = sanitizeFuzzyParams(baseParams)
-	mopsoParams := loadFloatArrayWithFallback(optimizedFuzzyPath, baseParams, "optimized fuzzy params")
-	mopsoParams = sanitizeFuzzyParams(mopsoParams)
+func initializeFuzzyEngines(algorithm, paramSource string) (FuzzyBootstrap, error) {
+	baseParams, baseSHA, err := loadFloatArrayStrict(baseFuzzyParamsPath, fuzzy.ParamCount, "base fuzzy params")
+	if err != nil {
+		return FuzzyBootstrap{}, err
+	}
+	outputMF, outputSHA, err := loadOutputMFStrict(outputFuzzyMFPath)
+	if err != nil {
+		return FuzzyBootstrap{}, err
+	}
 
 	bootstrap := FuzzyBootstrap{
-		BaseEngine:   fuzzy.NewEngine(baseParams),
-		MOPSOEngine:  fuzzy.NewEngine(mopsoParams),
+		BaseEngine:   fuzzy.NewEngine(baseParams, outputMF),
+		MOPSOEngine:  fuzzy.NewEngine(baseParams, outputMF),
 		ParamProfile: "BASE",
 	}
-	if algorithm == "fuzzy_mopso" || paramSource == "optimized" {
+	needOptimized := algorithm == "fuzzy_mopso" || paramSource == "optimized"
+	if needOptimized {
+		mopsoParams, mopsoSHA, loadErr := loadFloatArrayStrict(optimizedFuzzyParamsPath, fuzzy.ParamCount, "optimized fuzzy params")
+		if loadErr != nil {
+			return FuzzyBootstrap{}, fmt.Errorf("mode optimized aktif tetapi optimized params gagal dimuat: %w", loadErr)
+		}
+		bootstrap.MOPSOEngine = fuzzy.NewEngine(mopsoParams, outputMF)
 		bootstrap.ParamProfile = "OPTIMIZED_MOPSO"
+		logParamSnapshot("OPTIMIZED_MOPSO", "INPUT_PARAMS", optimizedFuzzyParamsPath, mopsoSHA, mopsoParams)
+		logParamSnapshot("OPTIMIZED_MOPSO", "OUTPUT_MF", outputFuzzyMFPath, outputSHA, outputMF)
 	}
+
+	logParamSnapshot("BASE", "INPUT_PARAMS", baseFuzzyParamsPath, baseSHA, baseParams)
+	logParamSnapshot("BASE", "OUTPUT_MF", outputFuzzyMFPath, outputSHA, outputMF)
 	log.Printf(
-		"[ENTRYPOINT][PARAM-SOURCE] ALGO=%s REQUESTED_SOURCE=%s PROFILE=%s BASE_FILE=%s MOPSO_FILE=%s",
+		"[ENTRYPOINT][PARAM-SOURCE] ALGO=%s REQUESTED_SOURCE=%s PROFILE=%s BASE_FILE=%s MOPSO_FILE=%s OUTPUT_MF_FILE=%s",
 		algorithm,
 		paramSource,
 		bootstrap.ParamProfile,
 		baseFuzzyParamsPath,
-		optimizedFuzzyPath,
+		optimizedFuzzyParamsPath,
+		outputFuzzyMFPath,
 	)
-	return bootstrap
+	return bootstrap, nil
 }
 
-func ensureBaseParamsFile(filename string, defaults []float64) {
-	if _, err := os.Stat(filename); err == nil {
-		return
-	}
-	if err := saveJSONToFile(filename, defaults); err != nil {
-		log.Printf("[WARNING] Gagal membuat base params file %s: %v", filename, err)
-	}
-}
-
-func loadFloatArrayWithFallback(filename string, fallback []float64, label string) []float64 {
-	data, err := os.ReadFile(filename)
+func loadFloatArrayStrict(filename string, wantLen int, label string) ([]float64, string, error) {
+	data, sha, err := readFileStrict(filename, label)
 	if err != nil {
-		log.Printf("[WARNING] File %s tidak ditemukan. Menggunakan %s default.", filename, label)
-		return append([]float64(nil), fallback...)
+		return nil, "", err
 	}
 	var out []float64
-	if err := json.Unmarshal(data, &out); err != nil || len(out) != len(fallback) {
-		log.Printf("[WARNING] Gagal membaca %s. Menggunakan %s default.", filename, label)
-		return append([]float64(nil), fallback...)
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, "", fmt.Errorf("%s %s tidak valid: %w", label, filename, err)
 	}
-	return out
+	if len(out) != wantLen {
+		return nil, "", fmt.Errorf("%s %s harus berisi %d angka, dapat %d", label, filename, wantLen, len(out))
+	}
+	return out, sha, nil
 }
 
-func saveJSONToFile(filename string, payload any) error {
-	if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil {
-		return err
-	}
-	file, err := os.Create(filename)
+func loadOutputMFStrict(filename string) ([3]fuzzy.Triple, string, error) {
+	data, sha, err := readFileStrict(filename, "output MF")
 	if err != nil {
-		return err
+		return [3]fuzzy.Triple{}, "", err
 	}
-	defer file.Close()
-	enc := json.NewEncoder(file)
-	enc.SetIndent("", "  ")
-	return enc.Encode(payload)
+	outputMF, err := fuzzy.ParseOutputMFConfig(data)
+	if err != nil {
+		return [3]fuzzy.Triple{}, "", fmt.Errorf("output MF %s tidak valid: %w", filename, err)
+	}
+	return outputMF, sha, nil
 }
 
-func sanitizeFuzzyParams(params []float64) []float64 {
-	out := append([]float64(nil), params...)
-	const eps = 1e-6
-	for i := 0; i+2 < len(out); i += 3 {
-		hi := 1000.0
-		if i <= 6 {
-			hi = 100
-		}
-		a := math.Max(0, math.Min(hi, out[i]))
-		b := math.Max(0, math.Min(hi, out[i+1]))
-		c := math.Max(0, math.Min(hi, out[i+2]))
-
-		if a > b {
-			a, b = b, a
-		}
-		if b > c {
-			b, c = c, b
-		}
-		if a > b {
-			a, b = b, a
-		}
-		if b < a+eps {
-			b = a + eps
-		}
-		if c < b+eps {
-			c = b + eps
-		}
-		if c > hi {
-			c = hi
-			if b > c-eps {
-				b = c - eps
-			}
-			if b < a+eps {
-				a = math.Max(0, b-eps)
-			}
-		}
-
-		out[i] = a
-		out[i+1] = b
-		out[i+2] = c
+func readFileStrict(filename, label string) ([]byte, string, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, "", fmt.Errorf("%s file %s gagal dibaca: %w", label, filename, err)
 	}
+	sum := sha256.Sum256(data)
+	return data, hex.EncodeToString(sum[:]), nil
+}
 
-	for i := 0; i+8 < len(out); i += 9 {
-		if out[i+2] < out[i+3] {
-			mid := (out[i+2] + out[i+3]) / 2
-			out[i+2] = mid
-			out[i+3] = mid
-		}
-		if out[i+5] < out[i+6] {
-			mid := (out[i+5] + out[i+6]) / 2
-			out[i+5] = mid
-			out[i+6] = mid
-		}
-	}
-	return out
+func logParamSnapshot(profile, kind, filename, sha string, payload any) {
+	log.Printf(
+		"[ENTRYPOINT][PARAM-SNAPSHOT] PROFILE=%s KIND=%s FILE=%s SHA256=%s DATA=%v",
+		profile,
+		kind,
+		filename,
+		sha,
+		payload,
+	)
 }

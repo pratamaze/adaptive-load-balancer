@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"sort"
 	"time"
+
+	"load-balancer/pkg/algorithm/fuzzy"
 )
 
 // OfflineSample adalah 1 jendela data hasil pengujian fuzzy biasa.
@@ -50,14 +52,14 @@ type OfflineResult struct {
 
 // EvaluateOfflineObjective menghitung DI/BCU berdasarkan rumus evaluasi skripsi
 // (berbasis rata-rata CPU node sepanjang dataset).
-func EvaluateOfflineObjective(params []float64, samples []OfflineSample) (OfflineObjective, error) {
+func EvaluateOfflineObjective(params []float64, outputMF [3]fuzzy.Triple, samples []OfflineSample) (OfflineObjective, error) {
 	if len(params) != Dimensions {
 		return OfflineObjective{}, errors.New("parameter harus berukuran 27")
 	}
 	if len(samples) == 0 {
 		return OfflineObjective{}, errors.New("dataset kosong")
 	}
-	di, bcu := evaluateDatasetDIAndBCU(params, samples)
+	di, bcu := evaluateDatasetDIAndBCU(params, outputMF, samples)
 	return OfflineObjective{DI: di, BCU: bcu}, nil
 }
 
@@ -79,7 +81,7 @@ func (c OfflineConfig) normalized() OfflineConfig {
 }
 
 // OptimizeOffline menjalankan MOPSO menggunakan dataset CSV hasil replay fuzzy.
-func OptimizeOffline(samples []OfflineSample, baseParams []float64, cfg OfflineConfig) (OfflineResult, error) {
+func OptimizeOffline(samples []OfflineSample, baseParams []float64, outputMF [3]fuzzy.Triple, cfg OfflineConfig) (OfflineResult, error) {
 	result := OfflineResult{GeneratedAt: time.Now().Format(time.RFC3339), SampleCount: len(samples)}
 	if len(baseParams) != Dimensions {
 		return result, errors.New("base params harus berukuran 27")
@@ -122,7 +124,7 @@ func OptimizeOffline(samples []OfflineSample, baseParams []float64, cfg OfflineC
 
 		for i := 0; i < cfg.Particles; i++ {
 			p := &particles[i]
-			di, bcu := evaluateDatasetDIAndBCU(p.x, samples)
+			di, bcu := evaluateDatasetDIAndBCU(p.x, outputMF, samples)
 			obj := Objective{Imbalance: di, PeakLoad: 1.0 - bcu}
 
 			if !p.hasBest || dominates(obj, p.pbestO) || (!dominates(p.pbestO, obj) && objectiveScore(obj) < objectiveScore(p.pbestO)) {
@@ -194,7 +196,7 @@ func OptimizeOffline(samples []OfflineSample, baseParams []float64, cfg OfflineC
 	return result, nil
 }
 
-func evaluateDatasetDIAndBCU(params []float64, samples []OfflineSample) (di, bcu float64) {
+func evaluateDatasetDIAndBCU(params []float64, outputMF [3]fuzzy.Triple, samples []OfflineSample) (di, bcu float64) {
 	var sumNormCPU1 float64
 	var sumNormCPU2 float64
 	var count int
@@ -219,8 +221,8 @@ func evaluateDatasetDIAndBCU(params []float64, samples []OfflineSample) (di, bcu
 		cpu1Raw := toRawCPU(s.Node1.CPUUsage, cap1)
 		cpu2Raw := toRawCPU(s.Node2.CPUUsage, cap2)
 
-		score1 := fuzzyScore(params, cpu1Fuzzy, s.Node1.QueueLength, s.Node1.ResponseTime)
-		score2 := fuzzyScore(params, cpu2Fuzzy, s.Node2.QueueLength, s.Node2.ResponseTime)
+		score1 := fuzzyScore(params, outputMF, cpu1Fuzzy, s.Node1.QueueLength, s.Node1.ResponseTime)
+		score2 := fuzzyScore(params, outputMF, cpu2Fuzzy, s.Node2.QueueLength, s.Node2.ResponseTime)
 		totalScore := score1 + score2
 
 		share1 := 0.5

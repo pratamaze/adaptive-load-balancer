@@ -6,6 +6,19 @@ import (
 	"testing"
 )
 
+func mustOutputMF(t *testing.T) [3]Triple {
+	t.Helper()
+	outputMF, err := BuildOutputMFSet(
+		[]float64{0, 0, 50},
+		[]float64{25, 50, 75},
+		[]float64{50, 100, 100},
+	)
+	if err != nil {
+		t.Fatalf("BuildOutputMFSet error: %v", err)
+	}
+	return outputMF
+}
+
 func TestFuzzyLogic(t *testing.T) {
 	// 1. Definisikan Rule Base untuk pengujian (Minimal 3 Aturan Dasar)
 	rules := []Rule{
@@ -43,7 +56,7 @@ func TestFuzzyLogic(t *testing.T) {
 		0, 50, 150, 100, 250, 400, 300, 500, 1000,
 		0, 150, 300, 200, 500, 800, 600, 850, 1000,
 	}
-	engine := NewEngine(defaultParams)
+	engine := NewEngine(defaultParams, mustOutputMF(t))
 
 	for _, tc := range testCases {
 		score := engine.CalculateMamdani(tc.metrics, rules)
@@ -95,5 +108,62 @@ func TestFuzzifyShoulderMembership(t *testing.T) {
 		if math.Abs(got-tt.want) > eps {
 			t.Fatalf("%s: got %.10f want %.10f", tt.name, got, tt.want)
 		}
+	}
+}
+
+func TestDefuzzifyMamdaniDiscreteCentroid(t *testing.T) {
+	outputMF := mustOutputMF(t)
+	tests := []struct {
+		name  string
+		alpha [3]float64
+		want  float64
+	}{
+		{
+			name:  "low_shoulder_matches_discrete_centroid",
+			alpha: [3]float64{1, 0, 0},
+			want:  416.5 / 25.5,
+		},
+		{
+			name:  "medium_triangle_stays_centered",
+			alpha: [3]float64{0, 1, 0},
+			want:  50.0,
+		},
+		{
+			name:  "high_shoulder_matches_discrete_centroid",
+			alpha: [3]float64{0, 0, 1},
+			want:  83.66666666666667,
+		},
+		{
+			name:  "no_active_rule_returns_zero",
+			alpha: [3]float64{},
+			want:  0.0,
+		},
+	}
+
+	const eps = 1e-9
+	for _, tt := range tests {
+		got := DefuzzifyMamdani(tt.alpha, outputMF)
+		if math.Abs(got-tt.want) > eps {
+			t.Fatalf("%s: got %.12f want %.12f", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestParseOutputMFConfig(t *testing.T) {
+	data := []byte(`{"rendah":[0,0,50],"sedang":[25,50,75],"tinggi":[50,100,100]}`)
+	got, err := ParseOutputMFConfig(data)
+	if err != nil {
+		t.Fatalf("ParseOutputMFConfig error: %v", err)
+	}
+	want := mustOutputMF(t)
+	if got != want {
+		t.Fatalf("ParseOutputMFConfig = %+v, want %+v", got, want)
+	}
+}
+
+func TestParseOutputMFConfigRejectsInvalidTriples(t *testing.T) {
+	data := []byte(`{"rendah":[0,0],"sedang":[25,50,75],"tinggi":[50,100,100]}`)
+	if _, err := ParseOutputMFConfig(data); err == nil {
+		t.Fatal("ParseOutputMFConfig should fail for invalid rendah triple length")
 	}
 }

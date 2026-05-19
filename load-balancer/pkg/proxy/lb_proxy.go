@@ -35,6 +35,7 @@ type LBProxyConfig struct {
 	AlgoLogInterval   time.Duration
 	ActiveStrategy    lbtypes.BalancerStrategy
 	DecisionSnapshotC chan *lbtypes.DecisionSnapshot
+	ResponseSampleC   chan *lbtypes.ResponseSample
 }
 
 type LBProxy struct {
@@ -46,6 +47,7 @@ type LBProxy struct {
 	activeStrategy    lbtypes.BalancerStrategy
 	fallbackStrategy  lbtypes.BalancerStrategy
 	decisionSnapshotC chan *lbtypes.DecisionSnapshot
+	responseSampleC   chan *lbtypes.ResponseSample
 
 	reverseProxy *httputil.ReverseProxy
 	mux          *http.ServeMux
@@ -68,6 +70,7 @@ func NewLBProxy(cfg LBProxyConfig) *LBProxy {
 		activeStrategy:    cfg.ActiveStrategy,
 		fallbackStrategy:  roundrobin.NewRoundRobinStrategy(),
 		decisionSnapshotC: cfg.DecisionSnapshotC,
+		responseSampleC:   cfg.ResponseSampleC,
 	}
 	if lb.activeStrategy == nil {
 		lb.activeStrategy = roundrobin.NewRoundRobinStrategy()
@@ -431,7 +434,23 @@ func (p *LBProxy) updateResponseRaw(node *lbtypes.BackendNode, sampleMS float64)
 	p.telemetryMu.Unlock()
 	node.UpdateResponseMS(sampleMS)
 	node.SetLastProxyLatencyMS(sampleMS)
+	p.enqueueResponseSample(node.Name, sampleMS)
 	metrics.SetFuzzyInputRTEma(metrics.NodeLabel(node.Name), sampleMS)
+}
+
+func (p *LBProxy) enqueueResponseSample(nodeName string, sampleMS float64) {
+	if p.responseSampleC == nil || sampleMS < 0 {
+		return
+	}
+	sample := &lbtypes.ResponseSample{
+		NodeName:  strings.TrimSpace(nodeName),
+		LatencyMS: sampleMS,
+	}
+	select {
+	case p.responseSampleC <- sample:
+	default:
+		log.Printf("[DATASET] Channel CSV response sample penuh, latency terlewati untuk node=%s", sample.NodeName)
+	}
 }
 
 func (p *LBProxy) applyDecisionFreshness(observed []lbtypes.BackendNode) []lbtypes.BackendNode {
@@ -440,7 +459,7 @@ func (p *LBProxy) applyDecisionFreshness(observed []lbtypes.BackendNode) []lbtyp
 	for _, n := range observed {
 		adjusted := n
 		adjusted.CPU = p.decayCPUForDecision(n.Name, n.CPU, now)
-		adjusted.RespMS = p.decayRTForDecision(n.Name, n.RespMS, n.Queue, now)
+		adjusted.RespMS = p.decayRTForDecision(n.Name, n.RespMS, now)
 		out = append(out, adjusted)
 	}
 	return out
@@ -469,12 +488,7 @@ func (p *LBProxy) decayCPUForDecision(nodeName string, observedCPU float64, now 
 	return clampCPU(decayed)
 }
 
-func (p *LBProxy) decayRTForDecision(nodeName string, observedRT float64, inflight float64, now time.Time) float64 {
-	_ = now
-	if inflight <= 0 {
-		return 0
-	}
-
+func (p *LBProxy) decayRTForDecision(nodeName string, observedRT float64, now time.Time) float64 {
 	p.telemetryMu.RLock()
 	state, ok := p.nodeTelemetry[nodeName]
 	p.telemetryMu.RUnlock()
@@ -484,7 +498,16 @@ func (p *LBProxy) decayRTForDecision(nodeName string, observedRT float64, inflig
 	if observedRT < 0 {
 		return 0
 	}
-	return observedRT
+	node := p.nodeByName(nodeName)
+	if node == nil {
+		return observedRT
+	}
+	lastObserved := node.LastRTObservedAt()
+	if lastObserved.IsZero() {
+		return observedRT
+	}
+	age := now.Sub(lastObserved)
+	return decayToBaseline(observedRT, 0.0, age, p.cpuStaleAfter, p.cpuDecayWindow)
 }
 
 func newDecisionSnapshot(observedNodes, decisionNodes []lbtypes.BackendNode, decisionTag string) *lbtypes.DecisionSnapshot {

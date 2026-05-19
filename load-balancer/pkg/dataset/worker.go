@@ -16,6 +16,7 @@ import (
 const (
 	cpuUsageUnitRaw = "raw_percent_of_host"
 	osIdleCPU10     = 3.0
+	recordWindow    = 1 * time.Second
 )
 
 var fuzzyTrainingDataHeader = []string{
@@ -47,6 +48,9 @@ var fuzzyTrainingDataHeader = []string{
 	"os_idle_cpu",
 }
 
+// perSecondAggregate menyimpan metrik window Data Plane.
+// Nilai CPU dan kapasitas sengaja tidak disimpan di sini agar worker
+// selalu membaca state terbaru dari Control Plane saat ticker berdetak.
 type perSecondAggregate struct {
 	node1Name string
 	node2Name string
@@ -54,24 +58,24 @@ type perSecondAggregate struct {
 	node1Req int64
 	node2Req int64
 
-	node1CPURawSum          float64
-	node2CPURawSum          float64
-	node1CPUNormalizedSum   float64
-	node2CPUNormalizedSum   float64
-	node1InflightSum        float64
-	node2InflightSum        float64
-	node1BackendInflightSum float64
-	node2BackendInflightSum float64
-	node1RTSum              float64
-	node2RTSum              float64
-	node1SampleN            int64
-	node2SampleN            int64
+	node1RTSum     float64
+	node2RTSum     float64
+	node1RTSamples int64
+	node2RTSamples int64
 
 	score1Sum float64
 	score2Sum float64
 	scoreN    int64
+}
 
-	lastSnapshot *lbtypes.DecisionSnapshot
+type nodeRuntimeSnapshot struct {
+	name            string
+	rawCPU          float64
+	normalizedCPU   float64
+	cpuCap          float64
+	proxyInflight   float64
+	backendInflight float64
+	queue           float64
 }
 
 func NewSnapshotChannel(buffer int) chan *lbtypes.DecisionSnapshot {
@@ -81,46 +85,88 @@ func NewSnapshotChannel(buffer int) chan *lbtypes.DecisionSnapshot {
 	return make(chan *lbtypes.DecisionSnapshot, buffer)
 }
 
-func StartWorker(csvPath string, snapshots <-chan *lbtypes.DecisionSnapshot, algorithm, trafficLogMode string) {
-	if snapshots == nil {
+func NewResponseSampleChannel(buffer int) chan *lbtypes.ResponseSample {
+	if buffer <= 0 {
+		buffer = 2048
+	}
+	return make(chan *lbtypes.ResponseSample, buffer)
+}
+
+func StartWorker(csvPath string, nodes []*lbtypes.BackendNode, snapshots <-chan *lbtypes.DecisionSnapshot, responseSamples <-chan *lbtypes.ResponseSample, algorithm, trafficLogMode string) {
+	if snapshots == nil && responseSamples == nil {
 		return
 	}
 
 	enabled := (algorithm == "fuzzy_base" || algorithm == "fuzzy_mopso") && trafficLogMode == config.TrafficLogModePerHit
 	if !enabled {
-		for range snapshots {
-		}
+		drainWorkerChannels(snapshots, responseSamples)
 		return
 	}
 
 	file, writer, err := initCSV(csvPath)
 	if err != nil {
 		log.Printf("[DATASET] Gagal inisialisasi CSV %s: %v", csvPath, err)
-		for range snapshots {
-		}
+		drainWorkerChannels(snapshots, responseSamples)
 		return
 	}
 	defer file.Close()
 
-	log.Printf("[DATASET] Recorder fuzzy agregasi 1 detik aktif ke file %s", csvPath)
+	log.Printf("[DATASET] Recorder control-plane 1 detik aktif ke file %s", csvPath)
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(recordWindow)
 	defer ticker.Stop()
 
-	agg := &perSecondAggregate{}
+	agg := newPerSecondAggregate(nodes)
 
 	for {
+		if snapshots == nil && responseSamples == nil {
+			flushAggregate(file, writer, nodes, agg, time.Now().UTC())
+			return
+		}
 		select {
 		case snapshot, ok := <-snapshots:
 			if !ok {
-				flushAggregate(file, writer, agg)
-				return
+				snapshots = nil
+				continue
 			}
 			accumulateSnapshot(agg, snapshot)
-		case <-ticker.C:
-			flushAggregate(file, writer, agg)
+		case sample, ok := <-responseSamples:
+			if !ok {
+				responseSamples = nil
+				continue
+			}
+			accumulateResponseSample(agg, sample)
+		case tickAt := <-ticker.C:
+			flushAggregate(file, writer, nodes, agg, tickAt.UTC())
 		}
 	}
+}
+
+func drainWorkerChannels(snapshots <-chan *lbtypes.DecisionSnapshot, responseSamples <-chan *lbtypes.ResponseSample) {
+	for snapshots != nil || responseSamples != nil {
+		select {
+		case _, ok := <-snapshots:
+			if !ok {
+				snapshots = nil
+			}
+		case _, ok := <-responseSamples:
+			if !ok {
+				responseSamples = nil
+			}
+		}
+	}
+}
+
+func newPerSecondAggregate(nodes []*lbtypes.BackendNode) *perSecondAggregate {
+	agg := &perSecondAggregate{}
+	nodeRefs := firstTwoNodes(nodes)
+	if nodeRefs[0] != nil {
+		agg.node1Name = strings.TrimSpace(nodeRefs[0].Name)
+	}
+	if nodeRefs[1] != nil {
+		agg.node2Name = strings.TrimSpace(nodeRefs[1].Name)
+	}
+	return agg
 }
 
 func accumulateSnapshot(agg *perSecondAggregate, snapshot *lbtypes.DecisionSnapshot) {
@@ -139,98 +185,41 @@ func accumulateSnapshot(agg *perSecondAggregate, snapshot *lbtypes.DecisionSnaps
 	switch selected {
 	case agg.node1Name:
 		agg.node1Req++
-		agg.node1CPURawSum += snapshot.CPU1
-		agg.node1CPUNormalizedSum += snapshot.CPU1Normalized
-		agg.node1InflightSum += snapshot.Q1
-		agg.node1BackendInflightSum += snapshot.Node1BackendQ
-		agg.node1RTSum += snapshot.RT1
-		agg.node1SampleN++
 	case agg.node2Name:
 		agg.node2Req++
-		agg.node2CPURawSum += snapshot.CPU2
-		agg.node2CPUNormalizedSum += snapshot.CPU2Normalized
-		agg.node2InflightSum += snapshot.Q2
-		agg.node2BackendInflightSum += snapshot.Node2BackendQ
-		agg.node2RTSum += snapshot.RT2
-		agg.node2SampleN++
 	}
 
 	agg.score1Sum += snapshot.Score1
 	agg.score2Sum += snapshot.Score2
 	agg.scoreN++
-
-	cp := *snapshot
-	agg.lastSnapshot = &cp
 }
 
-func flushAggregate(file *os.File, writer *bufio.Writer, agg *perSecondAggregate) {
+func accumulateResponseSample(agg *perSecondAggregate, sample *lbtypes.ResponseSample) {
+	if agg == nil || sample == nil || sample.LatencyMS <= 0 {
+		return
+	}
+
+	switch strings.TrimSpace(sample.NodeName) {
+	case agg.node1Name:
+		agg.node1RTSum += sample.LatencyMS
+		agg.node1RTSamples++
+	case agg.node2Name:
+		agg.node2RTSum += sample.LatencyMS
+		agg.node2RTSamples++
+	}
+}
+
+func flushAggregate(file *os.File, writer *bufio.Writer, nodes []*lbtypes.BackendNode, agg *perSecondAggregate, tickAt time.Time) {
 	if agg == nil || writer == nil || file == nil {
 		return
 	}
-	if strings.TrimSpace(agg.node1Name) == "" || strings.TrimSpace(agg.node2Name) == "" || agg.lastSnapshot == nil {
+
+	nodeStates := captureNodeStates(nodes, agg)
+	if strings.TrimSpace(nodeStates[0].name) == "" && strings.TrimSpace(nodeStates[1].name) == "" {
 		return
 	}
 
-	avgScore1 := 0.0
-	avgScore2 := 0.0
-	if agg.scoreN > 0 {
-		denom := float64(agg.scoreN)
-		avgScore1 = agg.score1Sum / denom
-		avgScore2 = agg.score2Sum / denom
-	}
-
-	s := agg.lastSnapshot
-	cpuCap1 := s.Node1CPUCap
-	cpuCap2 := s.Node2CPUCap
-	if cpuCap1 <= 0 {
-		cpuCap1 = 100
-	}
-	if cpuCap2 <= 0 {
-		cpuCap2 = 100
-	}
-
-	totalReq := agg.node1Req + agg.node2Req
-	avgNode1CPU := averageByCount(agg.node1CPURawSum, agg.node1SampleN)
-	avgNode2CPU := averageByCount(agg.node2CPURawSum, agg.node2SampleN)
-	avgNode1CPUNorm := averageByCount(agg.node1CPUNormalizedSum, agg.node1SampleN)
-	avgNode2CPUNorm := averageByCount(agg.node2CPUNormalizedSum, agg.node2SampleN)
-	avgNode1Inflight := averageByCount(agg.node1InflightSum, agg.node1SampleN)
-	avgNode2Inflight := averageByCount(agg.node2InflightSum, agg.node2SampleN)
-	avgNode1BackendInflight := averageByCount(agg.node1BackendInflightSum, agg.node1SampleN)
-	avgNode2BackendInflight := averageByCount(agg.node2BackendInflightSum, agg.node2SampleN)
-	avgNode1RT := averageByCount(agg.node1RTSum, agg.node1SampleN)
-	avgNode2RT := averageByCount(agg.node2RTSum, agg.node2SampleN)
-
-	record := []string{
-		time.Now().UTC().Format(time.RFC3339Nano),
-		"1000",
-		config.TrafficLogModePerHit,
-		cpuUsageUnitRaw,
-		agg.node1Name,
-		agg.node2Name,
-		strconv.FormatInt(agg.node1Req, 10),
-		strconv.FormatInt(agg.node2Req, 10),
-		strconv.FormatInt(totalReq, 10),
-		// Kolom raw dipertahankan untuk kompatibilitas dataset historis.
-		formatFloatCSV(avgNode1CPU),
-		formatFloatCSV(avgNode2CPU),
-		formatFloatCSV(avgNode1CPUNorm),
-		formatFloatCSV(avgNode2CPUNorm),
-		formatFloatCSV(cpuCap1),
-		formatFloatCSV(cpuCap2),
-		formatFloatCSV(avgNode1Inflight),
-		formatFloatCSV(avgNode2Inflight),
-		formatFloatCSV(avgNode1BackendInflight),
-		formatFloatCSV(avgNode2BackendInflight),
-		formatFloatCSV(avgNode1Inflight),
-		formatFloatCSV(avgNode2Inflight),
-		formatFloatCSV(avgNode1RT),
-		formatFloatCSV(avgNode2RT),
-		formatFloatCSV(avgScore1),
-		formatFloatCSV(avgScore2),
-		formatFloatCSV(osIdleCPU10),
-	}
-
+	record := buildCSVRecord(tickAt, nodeStates, agg)
 	if _, err := writer.WriteString(strings.Join(record, ",") + "\n"); err != nil {
 		log.Printf("[DATASET] Gagal tulis record agregasi: %v", err)
 		return
@@ -244,23 +233,141 @@ func flushAggregate(file *os.File, writer *bufio.Writer, agg *perSecondAggregate
 		return
 	}
 
+	resetWindowAggregate(agg)
+}
+
+func firstTwoNodes(nodes []*lbtypes.BackendNode) [2]*lbtypes.BackendNode {
+	var out [2]*lbtypes.BackendNode
+	idx := 0
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		out[idx] = node
+		idx++
+		if idx == len(out) {
+			break
+		}
+	}
+	return out
+}
+
+func captureNodeStates(nodes []*lbtypes.BackendNode, agg *perSecondAggregate) [2]nodeRuntimeSnapshot {
+	nodeRefs := firstTwoNodes(nodes)
+	return [2]nodeRuntimeSnapshot{
+		captureNodeState(nodeRefs[0], agg.node1Name),
+		captureNodeState(nodeRefs[1], agg.node2Name),
+	}
+}
+
+func captureNodeState(node *lbtypes.BackendNode, fallbackName string) nodeRuntimeSnapshot {
+	state := nodeRuntimeSnapshot{
+		name:   strings.TrimSpace(fallbackName),
+		cpuCap: 100.0,
+	}
+	if node == nil {
+		return state
+	}
+
+	snap := node.SnapshotForDecision()
+	if strings.TrimSpace(node.Name) != "" {
+		state.name = strings.TrimSpace(node.Name)
+	}
+
+	cpuCap := snap.CPUCap
+	if cpuCap <= 0 {
+		cpuCap = 100.0
+	}
+	rawCPU := clampPercent(snap.CPU)
+	queue := clampNonNegative(snap.Queue)
+	backendInflight := clampNonNegative(snap.Inflight)
+
+	state.rawCPU = rawCPU
+	state.cpuCap = cpuCap
+	state.normalizedCPU = lbtypes.CalculateNormalizedCPU(rawCPU, cpuCap)
+	state.proxyInflight = queue
+	state.backendInflight = backendInflight
+	state.queue = queue
+	return state
+}
+
+func buildCSVRecord(tickAt time.Time, nodes [2]nodeRuntimeSnapshot, agg *perSecondAggregate) []string {
+	if tickAt.IsZero() {
+		tickAt = time.Now().UTC()
+	}
+
+	avgScore1 := 0.0
+	avgScore2 := 0.0
+	if agg.scoreN > 0 {
+		denom := float64(agg.scoreN)
+		avgScore1 = agg.score1Sum / denom
+		avgScore2 = agg.score2Sum / denom
+	}
+
+	avgNode1RT := averageByCount(agg.node1RTSum, agg.node1RTSamples)
+	avgNode2RT := averageByCount(agg.node2RTSum, agg.node2RTSamples)
+	totalReq := agg.node1Req + agg.node2Req
+
+	return []string{
+		tickAt.Format(time.RFC3339Nano),
+		strconv.FormatInt(recordWindow.Milliseconds(), 10),
+		config.TrafficLogModePerHit,
+		cpuUsageUnitRaw,
+		nodes[0].name,
+		nodes[1].name,
+		strconv.FormatInt(agg.node1Req, 10),
+		strconv.FormatInt(agg.node2Req, 10),
+		strconv.FormatInt(totalReq, 10),
+		formatFloatCSV(nodes[0].rawCPU),
+		formatFloatCSV(nodes[1].rawCPU),
+		formatFloatCSV(nodes[0].normalizedCPU),
+		formatFloatCSV(nodes[1].normalizedCPU),
+		formatFloatCSV(nodes[0].cpuCap),
+		formatFloatCSV(nodes[1].cpuCap),
+		formatFloatCSV(nodes[0].proxyInflight),
+		formatFloatCSV(nodes[1].proxyInflight),
+		formatFloatCSV(nodes[0].backendInflight),
+		formatFloatCSV(nodes[1].backendInflight),
+		formatFloatCSV(nodes[0].queue),
+		formatFloatCSV(nodes[1].queue),
+		formatFloatCSV(avgNode1RT),
+		formatFloatCSV(avgNode2RT),
+		formatFloatCSV(avgScore1),
+		formatFloatCSV(avgScore2),
+		formatFloatCSV(osIdleCPU10),
+	}
+}
+
+func resetWindowAggregate(agg *perSecondAggregate) {
+	if agg == nil {
+		return
+	}
 	agg.node1Req = 0
 	agg.node2Req = 0
-	agg.node1CPURawSum = 0
-	agg.node2CPURawSum = 0
-	agg.node1CPUNormalizedSum = 0
-	agg.node2CPUNormalizedSum = 0
-	agg.node1InflightSum = 0
-	agg.node2InflightSum = 0
-	agg.node1BackendInflightSum = 0
-	agg.node2BackendInflightSum = 0
 	agg.node1RTSum = 0
 	agg.node2RTSum = 0
-	agg.node1SampleN = 0
-	agg.node2SampleN = 0
+	agg.node1RTSamples = 0
+	agg.node2RTSamples = 0
 	agg.score1Sum = 0
 	agg.score2Sum = 0
 	agg.scoreN = 0
+}
+
+func clampPercent(v float64) float64 {
+	if v <= 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
+}
+
+func clampNonNegative(v float64) float64 {
+	if v <= 0 {
+		return 0
+	}
+	return v
 }
 
 func initCSV(csvPath string) (*os.File, *bufio.Writer, error) {
