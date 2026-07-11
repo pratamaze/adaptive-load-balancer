@@ -18,8 +18,8 @@ def _(parser):
     parser.add_argument(
         "--endpoint-path",
         type=str,
-        default="/",
-        help="Path endpoint yang dipukul (contoh: / atau /api/ping)",
+        default="/api/stress-test?ms=50",
+        help="Path endpoint yang dipukul (contoh: /api/stress-test?ms=50 atau /api/ping)",
     )
 
 
@@ -33,57 +33,85 @@ class ScenarioProfile(object):
 
 class NormalProfile(ScenarioProfile):
     """
-    4 menit stabil medium-low di rentang 30-50 RPS.
-    Pola dibuat halus via gelombang sinus agar tetap di rentang itu.
+    15 menit stabil medium-low di rentang 30-50 RPS.
+    Period 140s → dalam 900s ada ~6.4 siklus.
+    Train (0-630s): ~4.5 siklus | Test (630-900s): ~2 siklus.
+    Keduanya identik secara statistik — mean dan amplitudo sama.
     """
 
     name = "normal"
-    duration_sec = 4 * 60
+    duration_sec = 15 * 60  # 900s
 
     def target_rps(self, t):
-        # 40 +/- 10 => 30..50
+        # period 60s → dalam 900s ada ~15 siklus (asli tidak diubah)
         rps = 40 + 10 * math.sin((2 * math.pi / 60.0) * t)
         return max(30, min(50, int(round(rps))))
 
 
 class SpikeProfile(ScenarioProfile):
     """
-    5 menit:
-    - menit 0-2: normal 40 RPS
-    - menit 2-3: spike 150-200 RPS
-    - menit 3-5: kembali normal 40 RPS
+    2 spike identik dalam 15 menit.
+    Spike 1 mulai t=120s, Spike 2 mulai t=660s.
+    Train (0-630s): baseline + spike pertama + recovery.
+    Test (630-900s): baseline + spike kedua + recovery.
+    Keduanya punya 1 spike lengkap yang representatif.
     """
 
     name = "spike"
-    duration_sec = 5 * 60
+    duration_sec = 15 * 60  # CHANGED: dari 3 menit → 15 menit penuh
+
+    baseline = 10
+    peak = 180
+    rise_dur = 30
+    hold_dur = 60
+    fall_dur = 30
+    # total satu spike event = 120s
 
     def target_rps(self, t):
-        if t < 120:
-            return 40
-        if t < 180:
-            # 175 +/- 25 => 150..200
-            rps = 175 + 25 * math.sin((2 * math.pi / 12.0) * (t - 120))
-            return max(150, min(200, int(round(rps))))
-        return 40
+        def spike_rps(offset):
+            """Hitung RPS relatif terhadap awal spike"""
+            rise_end = self.rise_dur                    # 30
+            hold_end = rise_end + self.hold_dur         # 90
+            fall_end = hold_end + self.fall_dur         # 120
+
+            if offset < 0 or offset >= fall_end:
+                return None  # di luar window spike
+            if offset < rise_end:
+                frac = offset / self.rise_dur
+                return int(round(self.baseline + frac * (self.peak - self.baseline)))
+            if offset < hold_end:
+                return self.peak
+            frac = (offset - hold_end) / self.fall_dur
+            return int(round(self.peak - frac * (self.peak - self.baseline)))
+
+        # CHANGED: 2 spike identik — spike 1 t=120s, spike 2 t=660s
+        for spike_start in [120, 660]:
+            result = spike_rps(t - spike_start)
+            if result is not None:
+                return result
+
+        return self.baseline
 
 
 class RampProfile(ScenarioProfile):
     """
-    5 menit:
-    - menit 0-3: ramp bertahap 10 -> 180 RPS
-    - menit 3-5: tahan di puncak 180 RPS
+    Sinusoidal siklikal — period 180s (3 menit/siklus) → 5 siklus penuh dalam 900s.
+    Train (0-630s): 3.5 siklus | Test (630-900s): 1.5 siklus.
+    Range beban identik: 10–75 RPS di kedua zona.
     """
 
     name = "ramp"
-    duration_sec = 5 * 60
+    duration_sec = 15 * 60  # 900s
 
     def target_rps(self, t):
-        peak = 180
-        if t < 180:
-            # Linear ramp 10 -> peak
-            rps = 10 + ((peak - 10) * (t / 180.0))
-            return max(10, min(peak, int(round(rps))))
-        return peak
+        low = 10
+        peak = 75
+        period = 180  # CHANGED: dari 300s → 180s agar test zone dapat siklus lengkap
+        mid = (peak + low) / 2        # 42.5
+        amplitude = (peak - low) / 2  # 32.5
+        # cosinus dimulai dari titik terendah
+        rps = mid - amplitude * math.cos((2 * math.pi / period) * t)
+        return int(round(max(low, min(peak, rps))))
 
 
 PROFILES = {
@@ -96,14 +124,13 @@ PROFILES = {
 def add_nocache_param(path):
     parts = urlsplit(path)
     query_items = parse_qsl(parts.query, keep_blank_values=True)
-    # Tambahkan nonce agar cache perantara tidak menyajikan response lama.
     query_items.append(("nocache", str(int(time.time() * 1000000000))))
     new_query = urlencode(query_items)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
 
 def build_target_url(host, endpoint_path):
-    endpoint_path = (endpoint_path or "/").strip()
+    endpoint_path = (endpoint_path or "/api/stress-test?ms=50").strip()
     if endpoint_path.startswith("http://") or endpoint_path.startswith("https://"):
         return endpoint_path
 
@@ -115,7 +142,6 @@ def build_target_url(host, endpoint_path):
 
 
 class LBUser(User):
-    # 1 user ~ 1 request/detik agar total user_count ~= target RPS
     wait_time = constant_throughput(1.0)
     request_timeout_sec = 10
 
@@ -133,16 +159,12 @@ class LBUser(User):
             "Pragma": "no-cache",
         }
 
-        # True cold request:
-        # - Buat Session BARU tiap request
-        # - Kirim header Connection: close
-        # - Tutup response + session di finally
         started = time.perf_counter()
         response = None
         err = None
         response_len = 0
         method = "GET"
-        request_name = endpoint if endpoint else "/"
+        request_name = endpoint if endpoint else "/api/stress-test?ms=50"
         one_shot_session = requests.Session()
 
         try:
@@ -177,23 +199,12 @@ class LBUser(User):
 
 
 class ScenarioShape(LoadTestShape):
-    """
-    Shape dispatcher untuk menjalankan 3 skenario secara independen
-    via argumen --scenario.
-
-    Mekanisme RPS:
-    - Setiap user ditargetkan ~1 req/s (constant_throughput=1)
-    - Maka user_count diset sama dengan target RPS.
-    """
-
     def _profile(self):
         scenario = self.runner.environment.parsed_options.scenario
         return PROFILES.get(scenario, PROFILES["normal"])
 
     def _calc_spawn_rate(self, current_users, target_users):
-        delta = abs(target_users - current_users)
-        # Cukup agresif saat transisi spike, tapi tidak terlalu ekstrem.
-        return max(10.0, min(500.0, float(delta if delta > 0 else 10)))
+        return 50.0
 
     def _shape_point(self, run_time):
         profile = self._profile()
